@@ -6,7 +6,7 @@
     <title>Controle HH</title>
     <link rel="stylesheet" href="./styles.css" />
     <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js" defer></script>
-    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.min.js" defer></script>
     <script src="./app.js" defer></script>
   </head>
   <body>
@@ -33,15 +33,17 @@
         <p id="statusText" class="status">Nenhum arquivo enviado.</p>
       </section>
 
-      <section id="summaryPanel" class="summary-grid" hidden></section>
-
-      <section id="downloadPanel" class="download-panel" hidden>
-        <button id="downloadButton" type="button">Baixar Excel processado</button>
+      <section id="resultHeader" class="result-header" hidden>
+        <div>
+          <p class="eyebrow">Resultado</p>
+          <h2 id="resultTitle">Processamento concluido</h2>
+          <p id="resultMeta"></p>
+        </div>
+        <button id="downloadButton" type="button">Baixar Excel</button>
       </section>
 
       <nav id="tabs" class="tabs" hidden></nav>
-      <section id="tablePanel" class="panel table-panel" hidden></section>
+      <section id="viewPanel" class="view-panel" hidden></section>
     </main>
   </body>
 </html>
-
