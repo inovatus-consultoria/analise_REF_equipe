@@ -21,13 +21,13 @@ const MONTHS = [
 ];
 
 const VIEW_TABS = [
-  ["overview", "Visão geral"],
-  ["alerts", "Alertas"],
-  ["calendar", "Calendário"],
-  ["worked", "Trabalho"],
-  ["paid", "Recebimentos"],
-  ["comparisons", "Comparações"],
-  ["f-treated", "F tratada"],
+  ["overview", "Visão geral", "resumo"],
+  ["alerts", "Alertas", "resumo"],
+  ["calendar", "Calendário", "cronogramas"],
+  ["worked", "Trabalho", "cronogramas"],
+  ["paid", "Recebimentos", "cronogramas"],
+  ["comparisons", "Comparações", "dados"],
+  ["f-treated", "F tratada", "dados"],
 ];
 
 const state = {
@@ -112,19 +112,21 @@ async function processSelectedFile(event) {
 
   try {
     processButton.disabled = true;
+    processButton.textContent = "Processando…";
     clearResults();
-    setStatus("Lendo arquivo no navegador...");
+    setStatus("Lendo arquivo no navegador…", "busy");
     const buffer = await file.arrayBuffer();
     const workbook = XLSX.read(buffer, { type: "array", cellDates: true, dense: false });
-    setStatus("Processando Base, C, D e F...");
+    setStatus("Processando Base, C, D e F…", "busy");
     state.result = runPipeline(workbook, file.name);
     renderResult(state.result);
-    setStatus("Processamento concluido. Nenhum dado foi enviado para servidor.");
+    setStatus("Concluído. Nenhum dado foi enviado para servidor.");
   } catch (error) {
     console.error(error);
-    setStatus(error.message || "Falha ao processar arquivo.", true);
+    setStatus(error.message || "Falha ao processar arquivo.", "error");
   } finally {
     processButton.disabled = APP_CONFIG.authRequired && !state.account;
+    processButton.textContent = "Processar";
   }
 }
 
@@ -598,7 +600,12 @@ function renderResult(result) {
   resultTitle.textContent = result.summary.Erros ? "Processado com pontos críticos" : "Processamento concluído";
   resultMeta.textContent = `${result.fileName} · ${formatDateTime(result.generatedAt)} · ${result.summary.Alertas} alertas agrupados`;
   tabs.hidden = false;
-  tabs.innerHTML = VIEW_TABS.map(([id, label], index) => `<button class="tab-button${index === 0 ? " active" : ""}" type="button" data-view="${id}">${escapeHtml(label)}</button>`).join("");
+  let lastGroup = null;
+  tabs.innerHTML = VIEW_TABS.map(([id, label, group], index) => {
+    const sep = group !== lastGroup && index > 0 ? '<span class="tab-sep" aria-hidden="true"></span>' : "";
+    lastGroup = group;
+    return `${sep}<button class="tab-button${index === 0 ? " active" : ""}" type="button" data-view="${id}">${escapeHtml(label)}</button>`;
+  }).join("");
   tabs.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => selectView(button.dataset.view)));
   state.currentView = "overview";
   selectView("overview");
@@ -660,8 +667,17 @@ function renderOverview() {
 }
 
 function renderAlertsView() {
+  const { summary } = state.result;
+  const hasErrors = summary.Erros > 0;
   return `
     <div class="view-content">
+      <div class="alert-verdict ${hasErrors ? "is-error" : summary.Atencoes ? "is-warning" : "is-ok"}">
+        <span class="status-dot${hasErrors ? " has-errors" : ""}"></span>
+        <div>
+          <div class="alert-verdict-title">${hasErrors ? "Há pontos críticos" : summary.Atencoes ? "Pontos de atenção" : "Tudo regular"}</div>
+          <div class="alert-verdict-meta">${summary.Erros} críticos · ${summary.Atencoes} atenções · ${summary.Alertas} grupos</div>
+        </div>
+      </div>
       <div class="filters">
         <input id="alertSearch" class="filter-input" type="search" placeholder="Buscar participante, atividade ou mensagem" />
         <select id="severityFilter" class="filter-select">
@@ -681,7 +697,42 @@ function renderAlertsView() {
 
 function renderAlertList(alerts) {
   if (!alerts.length) return '<div class="empty-state">Nenhum alerta para os filtros atuais.</div>';
-  return alerts.map(renderAlertItem).join("");
+  const groups = new Map();
+  alerts.forEach((item) => {
+    const key = `${item.categoria}||${item.origem}`;
+    if (!groups.has(key)) groups.set(key, { categoria: item.categoria, origem: item.origem, items: [], errors: 0, warnings: 0 });
+    const g = groups.get(key);
+    g.items.push(item);
+    if (item.severidade === "Erro") g.errors += 1;
+    else g.warnings += 1;
+  });
+  return Array.from(groups.values())
+    .sort((a, b) => b.errors - a.errors || b.items.length - a.items.length)
+    .map(renderAlertGroup)
+    .join("");
+}
+
+function renderAlertGroup(group) {
+  const total = group.items.length;
+  const badgeClass = group.errors ? "error" : "warning";
+  const badgeText = group.errors
+    ? `${group.errors} crítico(s)`
+    : `${group.warnings} atenção(ões)`;
+  return `
+    <section class="alert-group-block">
+      <button type="button" class="alert-group-toggle" aria-expanded="false">
+        <span class="chev" aria-hidden="true">›</span>
+        <span class="dot ${group.errors ? "error" : "warning"}"></span>
+        <span class="alert-title">${escapeHtml(group.categoria)}</span>
+        <span class="alert-group-spacer"></span>
+        <span class="alert-meta">${escapeHtml(group.origem)}</span>
+        <span class="badge ${badgeClass}">× ${total}</span>
+      </button>
+      <div class="alert-detail-list" hidden>
+        ${group.items.map(renderAlertItem).join("")}
+      </div>
+    </section>
+  `;
 }
 
 function renderAlertSummaryGroup(group) {
@@ -699,20 +750,16 @@ function renderAlertSummaryGroup(group) {
 }
 
 function renderAlertItem(item) {
-  const badgeClass = item.severidade === "Erro" ? "error" : "warning";
-  const context = [item.participante, item.atividade, item.campo].filter(Boolean).join(" · ");
-  const months = item.meses?.length ? `<div class="badge-row">${item.meses.map((month) => `<span class="badge">${escapeHtml(month)}</span>`).join("")}</div>` : "";
+  const who = [item.participante, item.atividade, item.campo].filter(Boolean).join(" · ") || item.mensagem;
+  const months = item.meses?.length
+    ? `<span class="alert-detail-months">${item.meses.map((m) => `<span class="badge">${escapeHtml(m)}</span>`).join("")}</span>`
+    : "";
+  const occ = item.count > 1 && !item.meses?.length ? `<span class="badge">× ${item.count}</span>` : "";
   return `
-    <article class="alert-item" data-search="${escapeHtml(normalizeText([item.severidade, item.categoria, item.origem, item.participante, item.atividade, item.campo, item.mensagem, (item.meses || []).join(" ")].join(" ")))}" data-severity="${escapeHtml(item.severidade)}" data-origin="${escapeHtml(item.origem)}">
-      <div class="alert-item-header">
-        <div>
-          <div class="alert-title">${escapeHtml(item.mensagem)}</div>
-          <div class="alert-meta">${escapeHtml(item.categoria)} · ${escapeHtml(item.origem)}${context ? ` · ${escapeHtml(context)}` : ""}</div>
-        </div>
-        <span class="badge ${badgeClass}">${escapeHtml(item.severidade)}${item.count > 1 ? ` · ${item.count}` : ""}</span>
-      </div>
-      ${months}
-    </article>
+    <div class="alert-detail-row" data-search="${escapeHtml(normalizeText([item.severidade, item.categoria, item.origem, item.participante, item.atividade, item.campo, item.mensagem, (item.meses || []).join(" ")].join(" ")))}" data-severity="${escapeHtml(item.severidade)}" data-origin="${escapeHtml(item.origem)}">
+      <span class="who">${escapeHtml(who)}</span>
+      <span class="where">${months || occ}</span>
+    </div>
   `;
 }
 
@@ -721,16 +768,24 @@ function renderGanttView(title, rows, labelKey, type) {
   if (!rows.length || !months.length) {
     return `<div class="view-content"><h2>${escapeHtml(title)}</h2><div class="empty-state">Sem dados para exibir.</div></div>`;
   }
+  const legend = {
+    activity: ["activity", "Atividade ativa"],
+    worked: ["worked", "Mês trabalhado (nº da atividade)"],
+    paid: ["paid", "Mês recebido"],
+  }[type] || ["activity", "Ativo"];
   return `
     <div class="view-content">
       <p class="eyebrow">Visualização mensal</p>
       <h2>${escapeHtml(title)}</h2>
+      <div class="gantt-legend">
+        <span class="key"><span class="swatch ${legend[0]}"></span>${escapeHtml(legend[1])}</span>
+      </div>
       <div class="gantt-shell">
         <table class="gantt">
           <thead>
             <tr>
               <th class="label-col">${escapeHtml(labelKey)}</th>
-              ${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}</th>`).join("")}
+              ${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}<span class="month-index">${escapeHtml(monthIndexLabel(month))}</span></th>`).join("")}
             </tr>
           </thead>
           <tbody>
@@ -740,6 +795,11 @@ function renderGanttView(title, rows, labelKey, type) {
       </div>
     </div>
   `;
+}
+
+function monthIndexLabel(label) {
+  const match = /^(\d{2}) - /.exec(label);
+  return match ? String(Number(match[1])) : "";
 }
 
 function renderGanttRow(row, months, labelKey, type) {
@@ -779,10 +839,14 @@ function renderComparison2Gantt(rows) {
   const months = monthColumns(rows);
   if (!rows.length || !months.length) return '<div class="empty-state">Sem dados para exibir.</div>';
   return `
+    <div class="gantt-legend">
+      <span class="key"><span class="swatch regular"></span>Regular</span>
+      <span class="key"><span class="swatch irregular"></span>Irregular</span>
+    </div>
     <div class="gantt-shell">
       <table class="gantt">
         <thead>
-          <tr><th class="label-col">Participante</th>${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}</th>`).join("")}</tr>
+          <tr><th class="label-col">Participante</th>${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}<span class="month-index">${escapeHtml(monthIndexLabel(month))}</span></th>`).join("")}</tr>
         </thead>
         <tbody>
           ${rows
@@ -817,6 +881,18 @@ function wireViewInteractions(viewId) {
   const severity = document.querySelector("#severityFilter");
   const origin = document.querySelector("#originFilter");
   [search, severity, origin].forEach((control) => control.addEventListener("input", applyAlertFilters));
+  wireAlertGroupToggles();
+}
+
+function wireAlertGroupToggles() {
+  document.querySelectorAll(".alert-group-toggle").forEach((toggle) => {
+    toggle.addEventListener("click", () => {
+      const detail = toggle.nextElementSibling;
+      const open = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!open));
+      detail.hidden = open;
+    });
+  });
 }
 
 function applyAlertFilters() {
@@ -828,6 +904,7 @@ function applyAlertFilters() {
     return (!term || searchable.includes(term)) && (!severity || item.severidade === severity) && (!origin || item.origem === origin);
   });
   document.querySelector("#alertList").innerHTML = renderAlertList(filtered);
+  wireAlertGroupToggles();
 }
 
 function downloadProcessedWorkbook() {
@@ -861,24 +938,28 @@ function styledSheet(rows, sheetName) {
 
 function cellStyle(value, header, sheetName, col) {
   const border = {
-    top: { style: "thin", color: { rgb: "D9E1EA" } },
-    bottom: { style: "thin", color: { rgb: "D9E1EA" } },
-    left: { style: "thin", color: { rgb: "D9E1EA" } },
-    right: { style: "thin", color: { rgb: "D9E1EA" } },
+    top: { style: "thin", color: { rgb: "E3E9F0" } },
+    bottom: { style: "thin", color: { rgb: "E3E9F0" } },
+    left: { style: "thin", color: { rgb: "E3E9F0" } },
+    right: { style: "thin", color: { rgb: "E3E9F0" } },
   };
   if (header) {
     return {
-      font: { bold: true, color: { rgb: "FFFFFF" } },
-      fill: { fgColor: { rgb: "1F5F99" } },
+      font: { bold: true, color: { rgb: "FFFFFF" }, sz: 11 },
+      fill: { fgColor: { rgb: "2B6CB0" } },
       alignment: { horizontal: "center", vertical: "center", wrapText: true },
       border,
     };
   }
-  const style = { alignment: { vertical: "top", wrapText: true }, border };
-  if (value === "Erro" || value === "Problema" || value === "Irregular") style.fill = { fgColor: { rgb: "FDE8E4" } };
-  if (value === "Atencao") style.fill = { fgColor: { rgb: "FFF2CC" } };
-  if (value === "Ok" || value === "Regular") style.fill = { fgColor: { rgb: "DFF4EA" } };
-  if (isMonthSheet(sheetName) && col > 0 && !isBlank(value)) style.fill = { fgColor: { rgb: sheetName.includes("Recebidos") ? "DFF4EA" : "DCEBFF" } };
+  const monthCol = isMonthSheet(sheetName) && col > 0;
+  const style = {
+    alignment: { vertical: "top", wrapText: true, horizontal: monthCol ? "center" : "left" },
+    border,
+  };
+  if (value === "Erro" || value === "Problema" || value === "Irregular") style.fill = { fgColor: { rgb: "FDECEA" } };
+  if (value === "Atencao") style.fill = { fgColor: { rgb: "FDF2D8" } };
+  if (value === "Ok" || value === "Regular") style.fill = { fgColor: { rgb: "E1F3EA" } };
+  if (monthCol && !isBlank(value)) style.fill = { fgColor: { rgb: sheetName.includes("Recebidos") ? "E1F3EA" : "E7F0FB" } };
   return style;
 }
 
@@ -1177,9 +1258,11 @@ function clearResults() {
   viewPanel.hidden = true;
 }
 
-function setStatus(message, isError = false) {
+function setStatus(message, kind = "idle") {
   statusText.textContent = message;
-  statusText.style.color = isError ? "var(--red)" : "var(--muted)";
+  statusText.classList.remove("is-error", "is-busy");
+  if (kind === true || kind === "error") statusText.classList.add("is-error");
+  else if (kind === "busy") statusText.classList.add("is-busy");
 }
 
 function escapeHtml(value) {
