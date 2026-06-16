@@ -34,7 +34,7 @@ const ALERT_EXPLAINS = {
   "F x D": "Recebe sem trabalhar: participante remunerado sem atividades previstas.",
   "D x F": "Planejado sem receber: participante presente apenas na aba D, sem remuneração na F.",
   "Comparacao 2": "Recebeu em meses sem atividade planejada na D.",
-  "Horas/mes": "Carga mensal acima de 176h.",
+  "Horas/mes": "Carga mensal acima de 170h.",
   "HH": "Valor-hora (HH) acima de R$ 250.",
   "Encargos 80": "Encargos acima de 80% da remuneração.",
   "Encargos 100": "Encargos acima de 100% da remuneração.",
@@ -578,8 +578,8 @@ function addPayrollAlerts(baseF, alerts) {
     const hoursPerMonth = toNumber(row["Horas trabalhadas/mes"]);
     const hh = toNumber(row.HH);
     const charges = toNumber(row["% de encargos"]);
-    if (hoursPerMonth > 176) {
-      alerts.push(alert("Atencao", "Carga horária", "Horas/mes", "Carga mensal acima de 176h.", { participante: who, explainKey: "Horas/mes" }));
+    if (hoursPerMonth > 170) {
+      alerts.push(alert("Atencao", "Carga horária", "Horas/mes", "Carga mensal acima de 170h.", { participante: who, explainKey: "Horas/mes" }));
     }
     if (hh > 250) {
       alerts.push(alert("Atencao", "Valor-hora", "HH", "Valor-hora (HH) acima de R$ 250.", { participante: who, explainKey: "HH" }));
@@ -1112,8 +1112,13 @@ function metricRow(label, value) {
 }
 
 function monthColumns(rows) {
+  if (state.result?.normalized?.calendario?.length) {
+    return orderedMonths(state.result.normalized.calendario);
+  }
   if (!rows.length) return [];
-  return Object.keys(rows[0]).filter((key) => /^\d{2} - /.test(key));
+  return Object.keys(rows[0])
+    .filter(isMonthColumn)
+    .sort((a, b) => monthColumnIndex(a) - monthColumnIndex(b));
 }
 
 function shortMonthHeader(label) {
@@ -1247,11 +1252,23 @@ function orderedMonths(calendar) {
 }
 
 function completeMonthRow(row, months) {
-  const output = { ...row };
+  const output = {};
+  Object.entries(row).forEach(([key, value]) => {
+    if (!isMonthColumn(key)) output[key] = value;
+  });
   months.forEach((month) => {
-    if (!(month in output)) output[month] = "";
+    output[month] = row[month] ?? "";
   });
   return output;
+}
+
+function isMonthColumn(key) {
+  return /^\d{2} - /.test(key);
+}
+
+function monthColumnIndex(label) {
+  const match = /^(\d{2}) - /.exec(label);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
 }
 
 function countDistinctMonths(rows) {
