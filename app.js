@@ -20,21 +20,33 @@ const MONTHS = [
   ["dezembro", "dez"],
 ];
 
+const VIEW_TABS = [
+  ["overview", "Visão geral"],
+  ["alerts", "Alertas"],
+  ["calendar", "Calendário"],
+  ["worked", "Trabalho"],
+  ["paid", "Recebimentos"],
+  ["comparisons", "Comparações"],
+  ["f-treated", "F tratada"],
+];
+
 const state = {
   msalClient: null,
   account: null,
   result: null,
+  currentView: "overview",
 };
 
 const uploadForm = document.querySelector("#uploadForm");
 const fileInput = document.querySelector("#fileInput");
 const processButton = document.querySelector("#processButton");
 const statusText = document.querySelector("#statusText");
-const summaryPanel = document.querySelector("#summaryPanel");
-const downloadPanel = document.querySelector("#downloadPanel");
+const resultHeader = document.querySelector("#resultHeader");
+const resultTitle = document.querySelector("#resultTitle");
+const resultMeta = document.querySelector("#resultMeta");
 const downloadButton = document.querySelector("#downloadButton");
 const tabs = document.querySelector("#tabs");
-const tablePanel = document.querySelector("#tablePanel");
+const viewPanel = document.querySelector("#viewPanel");
 const loginButton = document.querySelector("#loginButton");
 const logoutButton = document.querySelector("#logoutButton");
 const authStatus = document.querySelector("#authStatus");
@@ -105,7 +117,7 @@ async function processSelectedFile(event) {
     const buffer = await file.arrayBuffer();
     const workbook = XLSX.read(buffer, { type: "array", cellDates: true, dense: false });
     setStatus("Processando Base, C, D e F...");
-    state.result = runPipeline(workbook);
+    state.result = runPipeline(workbook, file.name);
     renderResult(state.result);
     setStatus("Processamento concluido. Nenhum dado foi enviado para servidor.");
   } catch (error) {
@@ -116,16 +128,18 @@ async function processSelectedFile(event) {
   }
 }
 
-function runPipeline(workbook) {
+function runPipeline(workbook, fileName) {
   const alerts = [];
   const extracted = extractWorkbook(workbook, alerts);
   const normalized = normalizeData(extracted, alerts);
   const transformed = transformData(normalized, alerts);
   addValidationAlerts(normalized, transformed, alerts);
-  const summary = buildSummary(normalized, transformed, alerts);
-  const outputs = {
+
+  const groupedAlerts = groupAlerts(alerts);
+  const summary = buildSummary(normalized, transformed, groupedAlerts);
+  const exportOutputs = {
     Resumo: objectToRows(summary),
-    Alertas: alerts.map((alert) => alertRecord(alert)),
+    Alertas: groupedAlerts.map(alertGroupRecord),
     "Calendario atividades": transformed.calendarioAtividades,
     "Meses Trabalhados": transformed.mesesTrabalhados,
     "Meses Recebidos ($)": transformed.mesesRecebidos,
@@ -133,7 +147,17 @@ function runPipeline(workbook) {
     "Comparacao 2": transformed.comparacao2,
     "F - Equipe tratada": normalized.baseF,
   };
-  return { summary, outputs, alerts };
+
+  return {
+    fileName,
+    generatedAt: new Date(),
+    normalized,
+    transformed,
+    alerts,
+    groupedAlerts,
+    summary,
+    exportOutputs,
+  };
 }
 
 function extractWorkbook(workbook, alerts) {
@@ -516,16 +540,25 @@ function addValidationAlerts(data, transformed, alerts) {
   planned.forEach((participant) => {
     if (!paid.has(participant)) alerts.push(alert("Atencao", "Participante", "D x F", "Participante planejado na D nao encontrado na F.", { participante: participant }));
   });
+
   transformed.comparacao2.forEach((row) => {
-    Object.entries(row).forEach(([column, value]) => {
-      if (column !== "Participante" && value === "Irregular") {
-        alerts.push(alert("Erro", "F x D", "Comparacao 2", "Participante recebeu no mes, mas nao possui atividade planejada na D.", { participante: row.Participante, mes: column }));
-      }
-    });
+    const months = Object.entries(row)
+      .filter(([column, value]) => column !== "Participante" && value === "Irregular")
+      .map(([column]) => column);
+    if (months.length) {
+      alerts.push(
+        alert("Erro", "F x D", "Comparacao 2", "Participante recebeu em meses sem atividade planejada na D.", {
+          participante: row.Participante,
+          meses: months,
+        }),
+      );
+    }
   });
 }
 
-function buildSummary(data, transformed, alerts) {
+function buildSummary(data, transformed, groupedAlerts) {
+  const errorCount = groupedAlerts.filter((item) => item.severidade === "Erro").length;
+  const warningCount = groupedAlerts.filter((item) => item.severidade === "Atencao").length;
   return {
     Atividades: data.baseC.length,
     "Participantes planejados": new Set(data.baseD.map((row) => row.Participante)).size,
@@ -533,51 +566,333 @@ function buildSummary(data, transformed, alerts) {
     "Registros atividade x mes": transformed.intC.length,
     "Registros trabalho planejado x mes": transformed.intD.length,
     "Registros remuneracao x mes": transformed.intF.length,
-    Alertas: alerts.length,
-    Erros: alerts.filter((item) => item.severidade === "Erro").length,
-    Atencoes: alerts.filter((item) => item.severidade === "Atencao").length,
+    Alertas: groupedAlerts.length,
+    Erros: errorCount,
+    Atencoes: warningCount,
   };
 }
 
+function groupAlerts(alerts) {
+  const map = new Map();
+  alerts.forEach((item) => {
+    const months = item.meses || (item.mes ? [item.mes] : []);
+    const key = [item.severidade, item.categoria, item.origem, item.participante || "", item.atividade || "", item.campo || "", item.mensagem].join("||");
+    if (!map.has(key)) {
+      map.set(key, {
+        ...item,
+        meses: [],
+        count: 0,
+      });
+    }
+    const group = map.get(key);
+    group.count += 1;
+    months.forEach((month) => {
+      if (!group.meses.includes(month)) group.meses.push(month);
+    });
+  });
+  return Array.from(map.values()).sort((a, b) => severityRank(a.severidade) - severityRank(b.severidade) || String(a.categoria).localeCompare(String(b.categoria)));
+}
+
 function renderResult(result) {
-  summaryPanel.hidden = false;
-  summaryPanel.innerHTML = Object.entries(result.summary)
-    .map(([label, value]) => `<article class="summary-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`)
-    .join("");
-
-  downloadPanel.hidden = false;
+  resultHeader.hidden = false;
+  resultTitle.textContent = result.summary.Erros ? "Processado com pontos críticos" : "Processamento concluído";
+  resultMeta.textContent = `${result.fileName} · ${formatDateTime(result.generatedAt)} · ${result.summary.Alertas} alertas agrupados`;
   tabs.hidden = false;
-  tabs.innerHTML = Object.keys(result.outputs)
-    .map((name, index) => `<button class="tab-button${index === 0 ? " active" : ""}" type="button" data-tab="${escapeHtml(name)}">${escapeHtml(name)}</button>`)
-    .join("");
-  tabs.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => selectTab(button.dataset.tab)));
-  selectTab(Object.keys(result.outputs)[0]);
+  tabs.innerHTML = VIEW_TABS.map(([id, label], index) => `<button class="tab-button${index === 0 ? " active" : ""}" type="button" data-view="${id}">${escapeHtml(label)}</button>`).join("");
+  tabs.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => selectView(button.dataset.view)));
+  state.currentView = "overview";
+  selectView("overview");
 }
 
-function selectTab(name) {
-  tabs.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.tab === name));
-  tablePanel.hidden = false;
-  tablePanel.innerHTML = renderTable(state.result.outputs[name] || []);
+function selectView(viewId) {
+  state.currentView = viewId;
+  tabs.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.view === viewId));
+  viewPanel.hidden = false;
+  viewPanel.innerHTML = renderView(viewId);
+  wireViewInteractions(viewId);
 }
 
-function renderTable(rows) {
-  if (!rows.length) return "<p>Nenhum registro.</p>";
+function renderView(viewId) {
+  if (!state.result) return "";
+  if (viewId === "overview") return renderOverview();
+  if (viewId === "alerts") return renderAlertsView();
+  if (viewId === "calendar") return renderGanttView("Calendário de atividades", state.result.transformed.calendarioAtividades, "Atividades", "activity");
+  if (viewId === "worked") return renderGanttView("Meses trabalhados", state.result.transformed.mesesTrabalhados, "Participante", "worked");
+  if (viewId === "paid") return renderGanttView("Meses recebidos", state.result.transformed.mesesRecebidos, "Participante", "paid");
+  if (viewId === "comparisons") return renderComparisons();
+  if (viewId === "f-treated") return `<div class="view-content">${renderDataTable(state.result.normalized.baseF)}</div>`;
+  return "";
+}
+
+function renderOverview() {
+  const { summary, groupedAlerts } = state.result;
+  const hasErrors = summary.Erros > 0;
+  const topGroups = summarizeAlertGroups(groupedAlerts).slice(0, 5);
+  return `
+    <div class="view-content overview-layout">
+      <section class="status-block">
+        <p class="eyebrow">Status</p>
+        <h2>${hasErrors ? "Revisão necessária" : "Pronto para revisão"}</h2>
+        <div class="status-line">
+          <span class="status-dot${hasErrors ? " has-errors" : ""}"></span>
+          <span>${summary.Erros} críticos · ${summary.Atencoes} atenções · ${summary.Alertas} grupos</span>
+        </div>
+        <div class="compact-metrics">
+          ${metricRow("Atividades", summary.Atividades)}
+          ${metricRow("Participantes planejados", summary["Participantes planejados"])}
+          ${metricRow("Participantes remunerados", summary["Participantes remunerados"])}
+          ${metricRow("Trabalho x mês", summary["Registros trabalho planejado x mes"])}
+          ${metricRow("Remuneração x mês", summary["Registros remuneracao x mes"])}
+        </div>
+      </section>
+      <section class="section-block">
+        <p class="eyebrow">O que revisar primeiro</p>
+        <div class="alert-summary-list">
+          ${
+            topGroups.length
+              ? topGroups.map(renderAlertSummaryGroup).join("")
+              : '<div class="empty-state">Nenhum alerta agrupado encontrado.</div>'
+          }
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderAlertsView() {
+  return `
+    <div class="view-content">
+      <div class="filters">
+        <input id="alertSearch" class="filter-input" type="search" placeholder="Buscar participante, atividade ou mensagem" />
+        <select id="severityFilter" class="filter-select">
+          <option value="">Todas severidades</option>
+          <option value="Erro">Críticos</option>
+          <option value="Atencao">Atenções</option>
+        </select>
+        <select id="originFilter" class="filter-select">
+          <option value="">Todas origens</option>
+          ${uniqueValues(state.result.groupedAlerts.map((item) => item.origem)).map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}
+        </select>
+      </div>
+      <div id="alertList" class="alert-list">${renderAlertList(state.result.groupedAlerts)}</div>
+    </div>
+  `;
+}
+
+function renderAlertList(alerts) {
+  if (!alerts.length) return '<div class="empty-state">Nenhum alerta para os filtros atuais.</div>';
+  return alerts.map(renderAlertItem).join("");
+}
+
+function renderAlertSummaryGroup(group) {
+  return `
+    <article class="alert-group">
+      <div class="alert-group-header">
+        <div>
+          <div class="alert-title">${escapeHtml(group.categoria)}</div>
+          <div class="alert-meta">${escapeHtml(group.origem)} · ${group.total} ocorrência(s)</div>
+        </div>
+        <span class="badge ${group.errors ? "error" : "warning"}">${group.errors} críticos · ${group.warnings} atenções</span>
+      </div>
+    </article>
+  `;
+}
+
+function renderAlertItem(item) {
+  const badgeClass = item.severidade === "Erro" ? "error" : "warning";
+  const context = [item.participante, item.atividade, item.campo].filter(Boolean).join(" · ");
+  const months = item.meses?.length ? `<div class="badge-row">${item.meses.map((month) => `<span class="badge">${escapeHtml(month)}</span>`).join("")}</div>` : "";
+  return `
+    <article class="alert-item" data-search="${escapeHtml(normalizeText([item.severidade, item.categoria, item.origem, item.participante, item.atividade, item.campo, item.mensagem, (item.meses || []).join(" ")].join(" ")))}" data-severity="${escapeHtml(item.severidade)}" data-origin="${escapeHtml(item.origem)}">
+      <div class="alert-item-header">
+        <div>
+          <div class="alert-title">${escapeHtml(item.mensagem)}</div>
+          <div class="alert-meta">${escapeHtml(item.categoria)} · ${escapeHtml(item.origem)}${context ? ` · ${escapeHtml(context)}` : ""}</div>
+        </div>
+        <span class="badge ${badgeClass}">${escapeHtml(item.severidade)}${item.count > 1 ? ` · ${item.count}` : ""}</span>
+      </div>
+      ${months}
+    </article>
+  `;
+}
+
+function renderGanttView(title, rows, labelKey, type) {
+  const months = monthColumns(rows);
+  if (!rows.length || !months.length) {
+    return `<div class="view-content"><h2>${escapeHtml(title)}</h2><div class="empty-state">Sem dados para exibir.</div></div>`;
+  }
+  return `
+    <div class="view-content">
+      <p class="eyebrow">Visualização mensal</p>
+      <h2>${escapeHtml(title)}</h2>
+      <div class="gantt-shell">
+        <table class="gantt">
+          <thead>
+            <tr>
+              <th class="label-col">${escapeHtml(labelKey)}</th>
+              ${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}</th>`).join("")}
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((row) => renderGanttRow(row, months, labelKey, type)).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderGanttRow(row, months, labelKey, type) {
+  return `
+    <tr>
+      <td class="label-col">${escapeHtml(row[labelKey] || "")}</td>
+      ${months.map((month) => renderGanttCell(row, month, type)).join("")}
+    </tr>
+  `;
+}
+
+function renderGanttCell(row, month, type) {
+  const value = row[month];
+  if (isBlank(value)) return '<td class="month-cell"></td>';
+  const title = `${row.Atividades || row.Participante || ""} · ${month}${type === "worked" ? ` · atividades ${value}` : ""}`;
+  if (type === "worked") return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark worked">${escapeHtml(value)}</span></td>`;
+  if (type === "paid") return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark paid"></span></td>`;
+  return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark activity"></span></td>`;
+}
+
+function renderComparisons() {
+  return `
+    <div class="view-content">
+      <section class="section-block">
+        <p class="eyebrow">Resumo por participante</p>
+        ${renderDataTable(state.result.transformed.comparacao1)}
+      </section>
+      <section class="section-block" style="margin-top: 16px;">
+        <p class="eyebrow">Regularidade mês a mês</p>
+        ${renderComparison2Gantt(state.result.transformed.comparacao2)}
+      </section>
+    </div>
+  `;
+}
+
+function renderComparison2Gantt(rows) {
+  const months = monthColumns(rows);
+  if (!rows.length || !months.length) return '<div class="empty-state">Sem dados para exibir.</div>';
+  return `
+    <div class="gantt-shell">
+      <table class="gantt">
+        <thead>
+          <tr><th class="label-col">Participante</th>${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}</th>`).join("")}</tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (row) => `<tr><td class="label-col">${escapeHtml(row.Participante || "")}</td>${months
+                .map((month) => {
+                  const value = row[month];
+                  return isBlank(value) ? '<td class="month-cell"></td>' : `<td class="month-cell"><span class="status-cell ${escapeHtml(value)}">${escapeHtml(value)}</span></td>`;
+                })
+                .join("")}</tr>`,
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderDataTable(rows) {
+  if (!rows.length) return '<div class="empty-state">Sem dados para exibir.</div>';
   const columns = Object.keys(rows[0]);
   const body = rows
-    .slice(0, 250)
+    .slice(0, 300)
     .map((row) => `<tr class="${escapeHtml(row.Severidade || "")}">${columns.map((column) => `<td>${formatDisplay(row[column])}</td>`).join("")}</tr>`)
     .join("");
-  return `<table><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
+  return `<div class="table-shell"><table class="data-table"><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function wireViewInteractions(viewId) {
+  if (viewId !== "alerts") return;
+  const search = document.querySelector("#alertSearch");
+  const severity = document.querySelector("#severityFilter");
+  const origin = document.querySelector("#originFilter");
+  [search, severity, origin].forEach((control) => control.addEventListener("input", applyAlertFilters));
+}
+
+function applyAlertFilters() {
+  const term = normalizeText(document.querySelector("#alertSearch").value);
+  const severity = document.querySelector("#severityFilter").value;
+  const origin = document.querySelector("#originFilter").value;
+  const filtered = state.result.groupedAlerts.filter((item) => {
+    const searchable = normalizeText([item.severidade, item.categoria, item.origem, item.participante, item.atividade, item.campo, item.mensagem, (item.meses || []).join(" ")].join(" "));
+    return (!term || searchable.includes(term)) && (!severity || item.severidade === severity) && (!origin || item.origem === origin);
+  });
+  document.querySelector("#alertList").innerHTML = renderAlertList(filtered);
 }
 
 function downloadProcessedWorkbook() {
   if (!state.result) return;
   const workbook = XLSX.utils.book_new();
-  Object.entries(state.result.outputs).forEach(([name, rows]) => {
-    const worksheet = XLSX.utils.json_to_sheet(rows.map(serializeRow));
+  Object.entries(state.result.exportOutputs).forEach(([name, rows]) => {
+    const worksheet = styledSheet(rows.map(serializeRow), name);
     XLSX.utils.book_append_sheet(workbook, worksheet, safeSheetName(name));
   });
   XLSX.writeFile(workbook, `controle_hh_processado_${timestamp()}.xlsx`);
+}
+
+function styledSheet(rows, sheetName) {
+  const worksheet = XLSX.utils.json_to_sheet(rows.length ? rows : [{}], { cellDates: true });
+  const range = worksheet["!ref"] ? XLSX.utils.decode_range(worksheet["!ref"]) : null;
+  if (!range) return worksheet;
+  worksheet["!autofilter"] = { ref: worksheet["!ref"] };
+  worksheet["!freeze"] = { xSplit: 0, ySplit: 1 };
+  worksheet["!cols"] = columnWidths(rows, range);
+
+  for (let row = range.s.r; row <= range.e.r; row += 1) {
+    for (let col = range.s.c; col <= range.e.c; col += 1) {
+      const address = XLSX.utils.encode_cell({ r: row, c: col });
+      if (!worksheet[address]) continue;
+      const header = row === 0;
+      worksheet[address].s = cellStyle(worksheet[address].v, header, sheetName, col);
+    }
+  }
+  return worksheet;
+}
+
+function cellStyle(value, header, sheetName, col) {
+  const border = {
+    top: { style: "thin", color: { rgb: "D9E1EA" } },
+    bottom: { style: "thin", color: { rgb: "D9E1EA" } },
+    left: { style: "thin", color: { rgb: "D9E1EA" } },
+    right: { style: "thin", color: { rgb: "D9E1EA" } },
+  };
+  if (header) {
+    return {
+      font: { bold: true, color: { rgb: "FFFFFF" } },
+      fill: { fgColor: { rgb: "1F5F99" } },
+      alignment: { horizontal: "center", vertical: "center", wrapText: true },
+      border,
+    };
+  }
+  const style = { alignment: { vertical: "top", wrapText: true }, border };
+  if (value === "Erro" || value === "Problema" || value === "Irregular") style.fill = { fgColor: { rgb: "FDE8E4" } };
+  if (value === "Atencao") style.fill = { fgColor: { rgb: "FFF2CC" } };
+  if (value === "Ok" || value === "Regular") style.fill = { fgColor: { rgb: "DFF4EA" } };
+  if (isMonthSheet(sheetName) && col > 0 && !isBlank(value)) style.fill = { fgColor: { rgb: sheetName.includes("Recebidos") ? "DFF4EA" : "DCEBFF" } };
+  return style;
+}
+
+function columnWidths(rows, range) {
+  const widths = [];
+  for (let col = range.s.c; col <= range.e.c; col += 1) {
+    let max = 10;
+    rows.slice(0, 300).forEach((row) => {
+      const value = Object.values(row)[col];
+      max = Math.max(max, Math.min(36, String(value ?? "").length + 2));
+    });
+    widths.push({ wch: max });
+  }
+  return widths;
 }
 
 function findSheet(workbook, aliases) {
@@ -606,21 +921,56 @@ function alert(severidade, categoria, origem, mensagem, extra = {}) {
   return { severidade, categoria, origem, mensagem, ...extra };
 }
 
-function alertRecord(item) {
+function alertGroupRecord(item) {
   return {
     Severidade: item.severidade,
     Categoria: item.categoria,
     Origem: item.origem,
     Participante: item.participante || "",
     Atividade: item.atividade || "",
-    Mes: item.mes || "",
+    Meses: item.meses?.join(", ") || "",
     Campo: item.campo || "",
+    Ocorrencias: item.count || 1,
     Mensagem: item.mensagem,
   };
 }
 
 function objectToRows(object) {
   return Object.entries(object).map(([Indicador, Valor]) => ({ Indicador, Valor }));
+}
+
+function summarizeAlertGroups(alerts) {
+  const map = new Map();
+  alerts.forEach((item) => {
+    const key = `${item.categoria}||${item.origem}`;
+    if (!map.has(key)) map.set(key, { categoria: item.categoria, origem: item.origem, errors: 0, warnings: 0, total: 0 });
+    const group = map.get(key);
+    group.total += 1;
+    if (item.severidade === "Erro") group.errors += 1;
+    else group.warnings += 1;
+  });
+  return Array.from(map.values()).sort((a, b) => b.errors - a.errors || b.total - a.total);
+}
+
+function metricRow(label, value) {
+  return `<div class="metric-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
+}
+
+function monthColumns(rows) {
+  if (!rows.length) return [];
+  return Object.keys(rows[0]).filter((key) => /^\d{2} - /.test(key));
+}
+
+function shortMonthHeader(label) {
+  return label.replace(/^\d{2} - /, "");
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
+}
+
+function severityRank(value) {
+  return value === "Erro" ? 0 : value === "Atencao" ? 1 : 2;
 }
 
 function normalizeText(value) {
@@ -803,9 +1153,17 @@ function safeSheetName(name) {
   return name.replace(/[\[\]:*?/\\]/g, "_").slice(0, 31);
 }
 
+function isMonthSheet(name) {
+  return ["Calendario atividades", "Meses Trabalhados", "Meses Recebidos ($)"].includes(name);
+}
+
 function timestamp() {
   const now = new Date();
   return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatDateTime(value) {
+  return value.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
 }
 
 function formatDisplay(value) {
@@ -814,10 +1172,9 @@ function formatDisplay(value) {
 }
 
 function clearResults() {
-  summaryPanel.hidden = true;
-  downloadPanel.hidden = true;
+  resultHeader.hidden = true;
   tabs.hidden = true;
-  tablePanel.hidden = true;
+  viewPanel.hidden = true;
 }
 
 function setStatus(message, isError = false) {
@@ -833,4 +1190,3 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
-
