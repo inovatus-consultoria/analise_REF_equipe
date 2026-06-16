@@ -661,7 +661,7 @@ function renderView(viewId) {
   if (viewId === "worked") return renderGanttView("Meses trabalhados", state.result.transformed.mesesTrabalhados, "Participante", "worked");
   if (viewId === "paid") return renderGanttView("Meses recebidos", state.result.transformed.mesesRecebidos, "Participante", "paid");
   if (viewId === "comparisons") return renderComparisons();
-  if (viewId === "f-treated") return `<div class="view-content">${renderDataTable(state.result.normalized.baseF)}</div>`;
+  if (viewId === "f-treated") return renderFTreatedView();
   return "";
 }
 
@@ -682,8 +682,6 @@ function renderOverview() {
           ${metricRow("Atividades", summary.Atividades)}
           ${metricRow("Participantes planejados", summary["Participantes planejados"])}
           ${metricRow("Participantes remunerados", summary["Participantes remunerados"])}
-          ${metricRow("Trabalho x mês", summary["Registros trabalho planejado x mes"])}
-          ${metricRow("Remuneração x mês", summary["Registros remuneracao x mes"])}
         </div>
       </section>
       <section class="section-block">
@@ -885,6 +883,17 @@ function renderComparisons() {
   `;
 }
 
+function renderFTreatedView() {
+  return `
+    <div class="view-content">
+      <div class="filters f-filters">
+        <input id="fParticipantFilter" class="filter-input" type="search" placeholder="Filtrar por participante" />
+      </div>
+      <div id="fTreatedTable">${renderDataTable(state.result.normalized.baseF, { context: "f-treated" })}</div>
+    </div>
+  `;
+}
+
 function renderComparison2Gantt(rows) {
   const months = monthColumns(rows);
   if (!rows.length || !months.length) return '<div class="empty-state">Sem dados para exibir.</div>';
@@ -927,13 +936,16 @@ function renderComparison2Row(row, months) {
   return `<tr data-irregular="${hasIrregular ? "1" : "0"}"><td class="label-col">${escapeHtml(row.Participante || "")}</td>${cells}</tr>`;
 }
 
-function renderDataTable(rows) {
+function renderDataTable(rows, options = {}) {
   if (!rows.length) return '<div class="empty-state">Sem dados para exibir.</div>';
   const columns = Object.keys(rows[0]);
   const numericCols = columns.filter((c) => columnFormat(c) !== "text");
   const body = rows
     .slice(0, 300)
-    .map((row) => `<tr class="${escapeHtml(row.Severidade || "")}">${columns.map((column) => `<td class="${numericCols.includes(column) ? "num" : ""}">${formatDisplay(row[column], column)}</td>`).join("")}</tr>`)
+    .map((row) => {
+      const search = options.context === "f-treated" ? normalizeText(row.Participante || "") : "";
+      return `<tr class="${escapeHtml(row.Severidade || "")}"${search ? ` data-participant="${escapeHtml(search)}"` : ""}>${columns.map((column) => `<td class="${cellClass(row, column, numericCols)}">${formatDisplay(row[column], column)}</td>`).join("")}</tr>`;
+    })
     .join("");
   return `<div class="table-shell"><table class="data-table"><thead><tr>${columns.map((column) => `<th class="${numericCols.includes(column) ? "num" : ""}">${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
@@ -950,12 +962,24 @@ function wireViewInteractions(viewId) {
     }
     return;
   }
+  if (viewId === "f-treated") {
+    const input = document.querySelector("#fParticipantFilter");
+    if (input) input.addEventListener("input", applyFParticipantFilter);
+    return;
+  }
   if (viewId !== "alerts") return;
   const search = document.querySelector("#alertSearch");
   const severity = document.querySelector("#severityFilter");
   const origin = document.querySelector("#originFilter");
   [search, severity, origin].forEach((control) => control.addEventListener("input", applyAlertFilters));
   wireAlertGroupToggles();
+}
+
+function applyFParticipantFilter() {
+  const term = normalizeText(document.querySelector("#fParticipantFilter").value);
+  document.querySelectorAll("#fTreatedTable tbody tr").forEach((tr) => {
+    tr.hidden = term && !tr.dataset.participant.includes(term);
+  });
 }
 
 function wireAlertGroupToggles() {
@@ -1109,6 +1133,27 @@ function summarizeAlertGroups(alerts) {
 
 function metricRow(label, value) {
   return `<div class="metric-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
+}
+
+function cellClass(row, column, numericCols) {
+  const classes = [];
+  if (numericCols.includes(column)) classes.push("num");
+  const risk = riskClass(row, column);
+  if (risk) classes.push(risk);
+  return classes.join(" ");
+}
+
+function riskClass(row, column) {
+  const normalized = normalizeText(column);
+  const value = toNumber(row[column]);
+  if (value === null) return "";
+  if (normalized === "hh" && value > 250) return "cell-warning";
+  if (normalized === "horas trabalhadas/mes" && value > 176) return "cell-warning";
+  if (normalized === "% de encargos") {
+    if (value > 1) return "cell-error";
+    if (value > 0.8) return "cell-warning";
+  }
+  return "";
 }
 
 function monthColumns(rows) {
