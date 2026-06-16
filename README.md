@@ -22,6 +22,11 @@ styles.css
 app.js
 ```
 
+As dependencias de navegador sao carregadas por CDN:
+
+- MSAL Browser, para autenticacao Microsoft quando ativada.
+- `xlsx-js-style`, para leitura e exportacao de Excel com formatacao minima.
+
 ## Deploy
 
 Publique os tres arquivos em um repositório GitHub Pages ou em Azure Static Web Apps.
@@ -50,4 +55,3 @@ python -m http.server 8080
 ```
 
 Depois acesse `http://localhost:8080`.
-
