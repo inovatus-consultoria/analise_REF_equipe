@@ -30,6 +30,16 @@ const VIEW_TABS = [
   ["f-treated", "F tratada", "dados"],
 ];
 
+const ALERT_EXPLAINS = {
+  "F x D": "Recebe sem trabalhar: participante remunerado sem atividades previstas.",
+  "D x F": "Planejado sem receber: participante presente apenas na aba D, sem remuneração na F.",
+  "Comparacao 2": "Recebeu em meses sem atividade planejada na D.",
+  "Horas/mes": "Carga mensal acima de 170h.",
+  "HH": "Valor-hora (HH) acima de R$ 250.",
+  "Encargos 80": "Encargos acima de 80% da remuneração.",
+  "Encargos 100": "Encargos acima de 100% da remuneração.",
+};
+
 const state = {
   msalClient: null,
   account: null,
@@ -537,10 +547,10 @@ function addValidationAlerts(data, transformed, alerts) {
   const planned = new Set(data.baseD.map((row) => row.Participante));
   const paid = new Set(data.baseF.map((row) => row.Participante));
   paid.forEach((participant) => {
-    if (!planned.has(participant)) alerts.push(alert("Erro", "Participante", "F x D", "Participante remunerado na F nao encontrado na D.", { participante: participant }));
+    if (!planned.has(participant)) alerts.push(alert("Erro", "Participante", "F x D", "Participante remunerado na F nao encontrado na D.", { participante: participant, explainKey: "F x D" }));
   });
   planned.forEach((participant) => {
-    if (!paid.has(participant)) alerts.push(alert("Atencao", "Participante", "D x F", "Participante planejado na D nao encontrado na F.", { participante: participant }));
+    if (!paid.has(participant)) alerts.push(alert("Atencao", "Participante", "D x F", "Participante planejado na D nao encontrado na F.", { participante: participant, explainKey: "D x F" }));
   });
 
   transformed.comparacao2.forEach((row) => {
@@ -552,8 +562,32 @@ function addValidationAlerts(data, transformed, alerts) {
         alert("Erro", "F x D", "Comparacao 2", "Participante recebeu em meses sem atividade planejada na D.", {
           participante: row.Participante,
           meses: months,
+          explainKey: "Comparacao 2",
         }),
       );
+    }
+  });
+
+  addPayrollAlerts(data.baseF, alerts);
+}
+
+function addPayrollAlerts(baseF, alerts) {
+  baseF.forEach((row) => {
+    const who = clean(row.Participante);
+    if (!who) return;
+    const hoursPerMonth = toNumber(row["Horas trabalhadas/mes"]);
+    const hh = toNumber(row.HH);
+    const charges = toNumber(row["% de encargos"]);
+    if (hoursPerMonth > 170) {
+      alerts.push(alert("Atencao", "Carga horária", "Horas/mes", "Carga mensal acima de 170h.", { participante: who, explainKey: "Horas/mes" }));
+    }
+    if (hh > 250) {
+      alerts.push(alert("Atencao", "Valor-hora", "HH", "Valor-hora (HH) acima de R$ 250.", { participante: who, explainKey: "HH" }));
+    }
+    if (charges > 1) {
+      alerts.push(alert("Erro", "Encargos", "Encargos 100", "Encargos acima de 100% da remuneração.", { participante: who, explainKey: "Encargos 100" }));
+    } else if (charges > 0.8) {
+      alerts.push(alert("Atencao", "Encargos", "Encargos 80", "Encargos acima de 80% da remuneração.", { participante: who, explainKey: "Encargos 80" }));
     }
   });
 }
@@ -700,7 +734,7 @@ function renderAlertList(alerts) {
   const groups = new Map();
   alerts.forEach((item) => {
     const key = `${item.categoria}||${item.origem}`;
-    if (!groups.has(key)) groups.set(key, { categoria: item.categoria, origem: item.origem, items: [], errors: 0, warnings: 0 });
+    if (!groups.has(key)) groups.set(key, { categoria: item.categoria, origem: item.origem, explainKey: item.explainKey, items: [], errors: 0, warnings: 0 });
     const g = groups.get(key);
     g.items.push(item);
     if (item.severidade === "Erro") g.errors += 1;
@@ -729,6 +763,7 @@ function renderAlertGroup(group) {
         <span class="badge ${badgeClass}">× ${total}</span>
       </button>
       <div class="alert-detail-list" hidden>
+        ${group.explainKey && ALERT_EXPLAINS[group.explainKey] ? `<div class="alert-explain"><span class="alert-explain-icon" aria-hidden="true">i</span><span>${escapeHtml(ALERT_EXPLAINS[group.explainKey])}</span></div>` : ""}
         ${group.items.map(renderAlertItem).join("")}
       </div>
     </section>
@@ -770,7 +805,7 @@ function renderGanttView(title, rows, labelKey, type) {
   }
   const legend = {
     activity: ["activity", "Atividade ativa"],
-    worked: ["worked", "Mês trabalhado (nº da atividade)"],
+    worked: ["worked", "Mês trabalhado (passe o mouse para ver atividades)"],
     paid: ["paid", "Mês recebido"],
   }[type] || ["activity", "Ativo"];
   return `
@@ -803,21 +838,36 @@ function monthIndexLabel(label) {
 }
 
 function renderGanttRow(row, months, labelKey, type) {
+  const active = months.map((month) => !isBlank(row[month]));
   return `
     <tr>
       <td class="label-col">${escapeHtml(row[labelKey] || "")}</td>
-      ${months.map((month) => renderGanttCell(row, month, type)).join("")}
+      ${months.map((month, i) => renderGanttCell(row, month, type, runPosition(active, i))).join("")}
     </tr>
   `;
 }
 
-function renderGanttCell(row, month, type) {
+function runPosition(active, i) {
+  if (!active[i]) return "";
+  const left = i > 0 && active[i - 1];
+  const right = i < active.length - 1 && active[i + 1];
+  if (left && right) return "mid";
+  if (right) return "start";
+  if (left) return "end";
+  return "solo";
+}
+
+function renderGanttCell(row, month, type, pos) {
   const value = row[month];
   if (isBlank(value)) return '<td class="month-cell"></td>';
-  const title = `${row.Atividades || row.Participante || ""} · ${month}${type === "worked" ? ` · atividades ${value}` : ""}`;
-  if (type === "worked") return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark worked">${escapeHtml(value)}</span></td>`;
-  if (type === "paid") return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark paid"></span></td>`;
-  return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark activity"></span></td>`;
+  const label = row.Atividades || row.Participante || "";
+  const cls = `mark ${type} run-${pos}`;
+  if (type === "worked") {
+    const tip = `${shortMonthHeader(month)} · atividade(s) ${value}`;
+    return `<td class="month-cell"><span class="${cls}" data-tip="${escapeHtml(tip)}" tabindex="0"></span></td>`;
+  }
+  const tip = `${label} · ${shortMonthHeader(month)}`;
+  return `<td class="month-cell"><span class="${cls}" data-tip="${escapeHtml(tip)}" tabindex="0"></span></td>`;
 }
 
 function renderComparisons() {
@@ -839,9 +889,13 @@ function renderComparison2Gantt(rows) {
   const months = monthColumns(rows);
   if (!rows.length || !months.length) return '<div class="empty-state">Sem dados para exibir.</div>';
   return `
-    <div class="gantt-legend">
-      <span class="key"><span class="swatch regular"></span>Regular</span>
-      <span class="key"><span class="swatch irregular"></span>Irregular</span>
+    <div class="gantt-toolbar">
+      <div class="gantt-legend">
+        <span class="key"><span class="swatch regular"></span>Regular</span>
+        <span class="key"><span class="swatch irregular"></span>Irregular</span>
+        <span class="info-icon" tabindex="0" data-tip="Irregular: o membro recebe e não trabalha naquele mês." aria-label="O que significa irregular">i</span>
+      </div>
+      <label class="irregular-toggle"><input type="checkbox" id="onlyIrregular" /> Mostrar apenas irregulares</label>
     </div>
     <div class="gantt-shell">
       <table class="gantt">
@@ -849,33 +903,53 @@ function renderComparison2Gantt(rows) {
           <tr><th class="label-col">Participante</th>${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}<span class="month-index">${escapeHtml(monthIndexLabel(month))}</span></th>`).join("")}</tr>
         </thead>
         <tbody>
-          ${rows
-            .map(
-              (row) => `<tr><td class="label-col">${escapeHtml(row.Participante || "")}</td>${months
-                .map((month) => {
-                  const value = row[month];
-                  return isBlank(value) ? '<td class="month-cell"></td>' : `<td class="month-cell"><span class="status-cell ${escapeHtml(value)}">${escapeHtml(value)}</span></td>`;
-                })
-                .join("")}</tr>`,
-            )
-            .join("")}
+          ${rows.map((row) => renderComparison2Row(row, months)).join("")}
         </tbody>
       </table>
     </div>
   `;
 }
 
+function renderComparison2Row(row, months) {
+  const hasIrregular = months.some((month) => row[month] === "Irregular");
+  const irregularFlags = months.map((month) => row[month] === "Irregular");
+  const regularFlags = months.map((month) => row[month] === "Regular");
+  const cells = months
+    .map((month, i) => {
+      const value = row[month];
+      if (isBlank(value)) return '<td class="month-cell"></td>';
+      const flags = value === "Irregular" ? irregularFlags : regularFlags;
+      const pos = runPosition(flags, i);
+      const tip = `${escapeHtml(row.Participante || "")} · ${shortMonthHeader(month)} · ${value}`;
+      return `<td class="month-cell"><span class="status-cell ${escapeHtml(value)} run-${pos}" data-tip="${tip}" tabindex="0"></span></td>`;
+    })
+    .join("");
+  return `<tr data-irregular="${hasIrregular ? "1" : "0"}"><td class="label-col">${escapeHtml(row.Participante || "")}</td>${cells}</tr>`;
+}
+
 function renderDataTable(rows) {
   if (!rows.length) return '<div class="empty-state">Sem dados para exibir.</div>';
   const columns = Object.keys(rows[0]);
+  const numericCols = columns.filter((c) => columnFormat(c) !== "text");
   const body = rows
     .slice(0, 300)
-    .map((row) => `<tr class="${escapeHtml(row.Severidade || "")}">${columns.map((column) => `<td>${formatDisplay(row[column])}</td>`).join("")}</tr>`)
+    .map((row) => `<tr class="${escapeHtml(row.Severidade || "")}">${columns.map((column) => `<td class="${numericCols.includes(column) ? "num" : ""}">${formatDisplay(row[column], column)}</td>`).join("")}</tr>`)
     .join("");
-  return `<div class="table-shell"><table class="data-table"><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
+  return `<div class="table-shell"><table class="data-table"><thead><tr>${columns.map((column) => `<th class="${numericCols.includes(column) ? "num" : ""}">${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 function wireViewInteractions(viewId) {
+  if (viewId === "comparisons") {
+    const toggle = document.querySelector("#onlyIrregular");
+    if (toggle) {
+      toggle.addEventListener("change", () => {
+        document.querySelectorAll("tr[data-irregular]").forEach((tr) => {
+          tr.hidden = toggle.checked && tr.dataset.irregular === "0";
+        });
+      });
+    }
+    return;
+  }
   if (viewId !== "alerts") return;
   const search = document.querySelector("#alertSearch");
   const severity = document.querySelector("#severityFilter");
@@ -1247,8 +1321,24 @@ function formatDateTime(value) {
   return value.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
 }
 
-function formatDisplay(value) {
+function columnFormat(column) {
+  const c = normalizeText(column);
+  if (/(remunerac|salario|total|valor|encargos\b|hh)/.test(c) && !c.includes("% de")) return "money";
+  if (c.includes("% de") || c.includes("percent")) return "percent";
+  if (c.includes("hora")) return "hours";
+  if (/(meses|mes de|linha)/.test(c)) return "int";
+  return "text";
+}
+
+function formatDisplay(value, column) {
   if (value instanceof Date) return escapeHtml(value.toLocaleDateString("pt-BR"));
+  if (column && typeof value === "number" && Number.isFinite(value)) {
+    const kind = columnFormat(column);
+    if (kind === "money") return escapeHtml(value.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+    if (kind === "percent") return escapeHtml(`${(value * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`);
+    if (kind === "hours") return escapeHtml(value.toLocaleString("pt-BR", { maximumFractionDigits: 1 }));
+    if (kind === "int") return escapeHtml(String(Math.round(value)));
+  }
   return escapeHtml(value ?? "");
 }
 
