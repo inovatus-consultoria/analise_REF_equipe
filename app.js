@@ -1,0 +1,1192 @@
+const APP_CONFIG = {
+  authRequired: false,
+  tenantId: "",
+  clientId: "",
+  redirectUri: window.location.href.split("#")[0],
+};
+
+const MONTHS = [
+  ["janeiro", "jan"],
+  ["fevereiro", "fev"],
+  ["marco", "mar"],
+  ["abril", "abr"],
+  ["maio", "mai"],
+  ["junho", "jun"],
+  ["julho", "jul"],
+  ["agosto", "ago"],
+  ["setembro", "set"],
+  ["outubro", "out"],
+  ["novembro", "nov"],
+  ["dezembro", "dez"],
+];
+
+const VIEW_TABS = [
+  ["overview", "Visão geral"],
+  ["alerts", "Alertas"],
+  ["calendar", "Calendário"],
+  ["worked", "Trabalho"],
+  ["paid", "Recebimentos"],
+  ["comparisons", "Comparações"],
+  ["f-treated", "F tratada"],
+];
+
+const state = {
+  msalClient: null,
+  account: null,
+  result: null,
+  currentView: "overview",
+};
+
+const uploadForm = document.querySelector("#uploadForm");
+const fileInput = document.querySelector("#fileInput");
+const processButton = document.querySelector("#processButton");
+const statusText = document.querySelector("#statusText");
+const resultHeader = document.querySelector("#resultHeader");
+const resultTitle = document.querySelector("#resultTitle");
+const resultMeta = document.querySelector("#resultMeta");
+const downloadButton = document.querySelector("#downloadButton");
+const tabs = document.querySelector("#tabs");
+const viewPanel = document.querySelector("#viewPanel");
+const loginButton = document.querySelector("#loginButton");
+const logoutButton = document.querySelector("#logoutButton");
+const authStatus = document.querySelector("#authStatus");
+
+window.addEventListener("DOMContentLoaded", init);
+
+function init() {
+  uploadForm.addEventListener("submit", processSelectedFile);
+  downloadButton.addEventListener("click", downloadProcessedWorkbook);
+
+  if (APP_CONFIG.authRequired) {
+    loginButton.hidden = false;
+    processButton.disabled = true;
+    authStatus.textContent = "Entre com Microsoft para processar.";
+    loginButton.addEventListener("click", login);
+    logoutButton.addEventListener("click", logout);
+  }
+}
+
+async function login() {
+  if (!window.msal) {
+    setStatus("Biblioteca Microsoft ainda nao carregou.", true);
+    return;
+  }
+  state.msalClient = new msal.PublicClientApplication({
+    auth: {
+      clientId: APP_CONFIG.clientId,
+      authority: `https://login.microsoftonline.com/${APP_CONFIG.tenantId}`,
+      redirectUri: APP_CONFIG.redirectUri,
+    },
+  });
+  const response = await state.msalClient.loginPopup({ scopes: ["User.Read"] });
+  state.account = response.account;
+  authStatus.textContent = response.account?.username || "Usuario autenticado";
+  loginButton.hidden = true;
+  logoutButton.hidden = false;
+  processButton.disabled = false;
+}
+
+async function logout() {
+  if (state.msalClient && state.account) {
+    await state.msalClient.logoutPopup({ account: state.account });
+  }
+  state.account = null;
+  loginButton.hidden = false;
+  logoutButton.hidden = true;
+  processButton.disabled = true;
+  authStatus.textContent = "Entre com Microsoft para processar.";
+}
+
+async function processSelectedFile(event) {
+  event.preventDefault();
+  if (APP_CONFIG.authRequired && !state.account) {
+    setStatus("Autenticacao obrigatoria.", true);
+    return;
+  }
+  if (!window.XLSX) {
+    setStatus("Biblioteca de Excel ainda nao carregou.", true);
+    return;
+  }
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  try {
+    processButton.disabled = true;
+    clearResults();
+    setStatus("Lendo arquivo no navegador...");
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: "array", cellDates: true, dense: false });
+    setStatus("Processando Base, C, D e F...");
+    state.result = runPipeline(workbook, file.name);
+    renderResult(state.result);
+    setStatus("Processamento concluido. Nenhum dado foi enviado para servidor.");
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Falha ao processar arquivo.", true);
+  } finally {
+    processButton.disabled = APP_CONFIG.authRequired && !state.account;
+  }
+}
+
+function runPipeline(workbook, fileName) {
+  const alerts = [];
+  const extracted = extractWorkbook(workbook, alerts);
+  const normalized = normalizeData(extracted, alerts);
+  const transformed = transformData(normalized, alerts);
+  addValidationAlerts(normalized, transformed, alerts);
+
+  const groupedAlerts = groupAlerts(alerts);
+  const summary = buildSummary(normalized, transformed, groupedAlerts);
+  const exportOutputs = {
+    Resumo: objectToRows(summary),
+    Alertas: groupedAlerts.map(alertGroupRecord),
+    "Calendario atividades": transformed.calendarioAtividades,
+    "Meses Trabalhados": transformed.mesesTrabalhados,
+    "Meses Recebidos ($)": transformed.mesesRecebidos,
+    "Comparacao 1": transformed.comparacao1,
+    "Comparacao 2": transformed.comparacao2,
+    "F - Equipe tratada": normalized.baseF,
+  };
+
+  return {
+    fileName,
+    generatedAt: new Date(),
+    normalized,
+    transformed,
+    alerts,
+    groupedAlerts,
+    summary,
+    exportOutputs,
+  };
+}
+
+function extractWorkbook(workbook, alerts) {
+  const baseSheet = findSheet(workbook, ["BASE", "Base"]);
+  const cSheet = findSheet(workbook, ["C - DADOS ATIVIDADES", "C - Atividades"]);
+  const dSheet = findSheet(workbook, ["D - DADOS EQUIPE", "D - Dados Equipe"]);
+  const fSheet = findSheet(workbook, ["F - Desp. EQUIPE", "F - Equipe ($)"]);
+
+  if (!baseSheet) alerts.push(alert("Erro", "Layout", "Extracao", "Aba Base nao encontrada.", { campo: "Base" }));
+  if (!cSheet) alerts.push(alert("Erro", "Layout", "Extracao", "Aba C nao encontrada.", { campo: "C" }));
+  if (!dSheet) alerts.push(alert("Erro", "Layout", "Extracao", "Aba D nao encontrada.", { campo: "D" }));
+  if (!fSheet) alerts.push(alert("Erro", "Layout", "Extracao", "Aba F nao encontrada.", { campo: "F" }));
+
+  return {
+    baseRaw: baseSheet ? extractBase(sheetRows(baseSheet)) : [],
+    cRaw: cSheet ? extractC(sheetRows(cSheet)) : [],
+    dRaw: dSheet ? extractD(sheetRows(dSheet)) : [],
+    fRaw: fSheet ? extractF(sheetRows(fSheet)) : [],
+  };
+}
+
+function extractBase(rows) {
+  const records = [];
+  rows.forEach((row, index) => {
+    const label = row[0];
+    const key = normalizeText(label);
+    if (key.startsWith("base.") || key.includes("data de inicio projeto")) {
+      records.push({ Campo: label, Valor: firstNonBlank(row.slice(1, 4)), Linha: index + 1 });
+    }
+  });
+  return records;
+}
+
+function extractC(rows) {
+  const header = findHeaderRow(rows, ["C.1", "ATIVIDADE"], 15);
+  if (header < 0) return [];
+  const records = [];
+  for (let r = header + 1; r < rows.length; r += 1) {
+    const row = rows[r];
+    const activity = row[0];
+    if (!looksLikeActivity(activity)) continue;
+    records.push({
+      "C.1 - Atividade": activity,
+      "C.2 - Detalhamento": row[1],
+      "C.3 - Ano": row[2],
+      "C.4 - Mes": row[3],
+      "C.5 - Duracao": row[4],
+      "Data de inicio": row[5],
+      "Data de fim": row[6],
+      "Mes de inicio": row[7],
+      "Mes de fim": row[8],
+      Linha: r + 1,
+    });
+  }
+  return records;
+}
+
+function extractD(rows) {
+  const header = findHeaderRow(rows, ["D.1", "NOME"], 12);
+  if (header < 0) return [];
+  const records = [];
+  for (let r = header + 1; r < rows.length; r += 1) {
+    const row = rows[r];
+    if (isBlank(row[0])) continue;
+    const record = {
+      Participante: clean(row[0]),
+      CPF: row[1],
+      Funcao: row[2],
+      Formacao: row[3],
+      "Periodo informado": toInt(row[4]),
+      Linha: r + 1,
+    };
+    for (let i = 1; i <= 30; i += 1) record[`ATIV. ${i}`] = row[4 + i];
+    records.push(record);
+  }
+  return records;
+}
+
+function extractF(rows) {
+  const header = findHeaderRow(rows, ["F.1", "UNIDADE"], 12);
+  if (header < 0) return [];
+  const records = [];
+  for (let r = header + 1; r < rows.length; r += 1) {
+    const row = rows[r];
+    if (row.slice(1, 11).every(isBlank)) continue;
+    records.push({
+      Rubrica: row[0],
+      Unidade: row[1],
+      "Tipo remuneracao": row[2],
+      Participante: row[3],
+      Referencia: row[4],
+      Justificativa: row[5],
+      "Inicio periodo": row[6],
+      "Termino periodo": row[7],
+      Horas: row[8],
+      Remuneracao: row[9],
+      Encargos: row[10],
+      Linha: r + 1,
+    });
+  }
+  return records;
+}
+
+function normalizeData(extracted, alerts) {
+  const { projectStart, projectEnd } = projectDates(extracted, alerts);
+  const calendario = buildCalendar(projectStart, projectEnd);
+  const baseC = normalizeC(extracted.cRaw, projectStart, alerts);
+  const baseD = normalizeD(extracted.dRaw, alerts);
+  const baseF = normalizeF(extracted.fRaw, projectStart, alerts);
+  return { projectStart, projectEnd, calendario, baseC, baseD, baseF };
+}
+
+function projectDates(extracted, alerts) {
+  let projectStart = null;
+  let projectEnd = null;
+  extracted.baseRaw.forEach((row) => {
+    const key = normalizeText(row.Campo);
+    if (key.includes("data de contrat") || key.includes("data de inicio")) projectStart = toDate(row.Valor);
+    if (key.includes("data de conclus") || key.includes("data de encerramento")) projectEnd = toDate(row.Valor);
+  });
+
+  if (!projectStart) {
+    const dates = [
+      ...extracted.cRaw.map((row) => toDate(row["Data de inicio"]) || dateFromYearMonth(row["C.3 - Ano"], row["C.4 - Mes"])),
+      ...extracted.fRaw.map((row) => toDate(row["Inicio periodo"])),
+    ].filter(Boolean);
+    if (dates.length) {
+      projectStart = minDate(dates);
+      alerts.push(alert("Atencao", "Datas", "Base", "Data de inicio ausente; usando menor data encontrada em C/F.", { campo: "Base" }));
+    }
+  }
+
+  if (!projectEnd) {
+    const dates = [];
+    extracted.cRaw.forEach((row) => {
+      const start = toDate(row["Data de inicio"]) || dateFromYearMonth(row["C.3 - Ano"], row["C.4 - Mes"]);
+      const duration = toInt(row["C.5 - Duracao"]);
+      const explicitEnd = toDate(row["Data de fim"]);
+      if (explicitEnd) dates.push(explicitEnd);
+      else if (start && duration !== null) dates.push(addMonths(start, duration));
+    });
+    extracted.fRaw.forEach((row) => {
+      const end = toDate(row["Termino periodo"]);
+      if (end) dates.push(end);
+    });
+    if (dates.length) {
+      projectEnd = maxDate(dates);
+      alerts.push(alert("Atencao", "Datas", "Base", "Data de conclusao ausente; usando maior data encontrada em C/F.", { campo: "Base" }));
+    }
+  }
+
+  if (!projectStart || !projectEnd) {
+    alerts.push(alert("Erro", "Datas", "Base", "Nao foi possivel determinar inicio/conclusao do projeto.", { campo: "Base" }));
+  }
+  return { projectStart, projectEnd };
+}
+
+function buildCalendar(start, end) {
+  if (!start || !end || end < start) return [];
+  const lastSeq = monthIndex(start, end);
+  const rows = [];
+  for (let seq = 0; seq <= lastSeq; seq += 1) {
+    const current = addMonths(monthStart(start), seq);
+    const mesAno = monthYearLabel(current);
+    rows.push({
+      "Mes Sequencial": seq,
+      "Mes Ano": mesAno,
+      Rotulo_Mes: `${String(seq).padStart(2, "0")} - ${mesAno}`,
+      "Data inicio do mes": current,
+    });
+  }
+  return rows;
+}
+
+function normalizeC(rows, projectStart, alerts) {
+  if (!rows.length) alerts.push(alert("Erro", "Layout", "C", "Nenhuma atividade C encontrada.", { campo: "C" }));
+  return rows
+    .filter((row) => !isBlank(row["C.1 - Atividade"]))
+    .map((row) => {
+      const start = toDate(row["Data de inicio"]) || dateFromYearMonth(row["C.3 - Ano"], row["C.4 - Mes"]);
+      const duration = toInt(row["C.5 - Duracao"]);
+      const end = toDate(row["Data de fim"]) || (start && duration !== null ? addMonths(start, duration) : null);
+      if (!start || !end) {
+        alerts.push(alert("Erro", "Datas", "C", "Atividade com data inicial/final invalida.", { atividade: clean(row["C.1 - Atividade"]), campo: "Data" }));
+      }
+      return {
+        Atividade: clean(row["C.1 - Atividade"]),
+        Detalhamento: row["C.2 - Detalhamento"],
+        Ano: toInt(row["C.3 - Ano"]),
+        Mes: row["C.4 - Mes"],
+        Duracao: duration,
+        "Data de inicio": start,
+        "Data de fim": end,
+        "Mes de inicio": projectStart && start ? monthIndex(projectStart, start) : toInt(row["Mes de inicio"]),
+        "Mes de fim": projectStart && end ? monthIndex(projectStart, end) : toInt(row["Mes de fim"]),
+        Atividade_Ordenada: activitySortName(row["C.1 - Atividade"]),
+      };
+    });
+}
+
+function normalizeD(rows, alerts) {
+  if (!rows.length) alerts.push(alert("Erro", "Layout", "D", "Nenhum participante D encontrado.", { campo: "D" }));
+  return rows.map((row) => {
+    if (isBlank(row.CPF)) {
+      alerts.push(alert("Erro", "Dados obrigatorios", "D", "Participante sem CPF informado.", { participante: row.Participante, campo: "CPF" }));
+    }
+    return row;
+  });
+}
+
+function normalizeF(rows, projectStart, alerts) {
+  if (!rows.length) alerts.push(alert("Erro", "Layout", "F", "Nenhuma linha F valida encontrada.", { campo: "F" }));
+  return rows
+    .filter((row) => !isBlank(row.Participante))
+    .map((row) => {
+      const start = toDate(row["Inicio periodo"]);
+      const end = toDate(row["Termino periodo"]);
+      const hours = toNumber(row.Horas);
+      const pay = toNumber(row.Remuneracao);
+      const charges = toNumber(row.Encargos);
+      const startSeq = projectStart && start ? monthIndex(projectStart, start) : null;
+      const endSeq = projectStart && end ? monthIndex(projectStart, end) : null;
+      const months = inclusiveMonths(startSeq, endSeq).length || null;
+      if (!start || !end || end < start) {
+        alerts.push(alert("Erro", "Datas", "F", "Linha remunerada com datas invalidas.", { participante: clean(row.Participante), campo: "F.6/F.7" }));
+      }
+      return {
+        Rubrica: row.Rubrica,
+        Unidade: row.Unidade,
+        "Tipo remuneracao": row["Tipo remuneracao"],
+        Participante: clean(row.Participante),
+        Referencia: row.Referencia,
+        Justificativa: row.Justificativa,
+        "Inicio periodo": start,
+        "Termino periodo": end,
+        Horas: hours,
+        Remuneracao: pay,
+        Encargos: charges,
+        "TOTAL (REMUN. + ENCARGOS)": (pay || 0) + (charges || 0),
+        "Meses recebidos": months,
+        HH: safeDiv(pay, hours),
+        "Salario mensal": safeDiv(pay, months),
+        "Horas trabalhadas/mes": safeDiv(hours, months),
+        "% de encargos": safeDiv(charges, pay),
+        "Mes de inicio": startSeq,
+        "Mes de fim": endSeq,
+      };
+    });
+}
+
+function transformData(data, alerts) {
+  const intC = [];
+  const calendarBySeq = new Map(data.calendario.map((row) => [row["Mes Sequencial"], row]));
+  data.baseC.forEach((activity) => {
+    inclusiveMonths(activity["Mes de inicio"], activity["Mes de fim"]).forEach((seq) => {
+      const cal = calendarBySeq.get(seq);
+      if (!cal) return;
+      intC.push({ Atividade: activity.Atividade, Atividade_Ordenada: activity.Atividade_Ordenada, ...cal });
+    });
+  });
+
+  const intDPart = [];
+  data.baseD.forEach((person) => {
+    for (let i = 1; i <= 30; i += 1) {
+      if (!isBlank(person[`ATIV. ${i}`])) {
+        intDPart.push({ ...person, Atividade: `ATIV. ${i}` });
+      }
+    }
+  });
+
+  const activityMonths = groupBy(intC, "Atividade");
+  const intD = [];
+  intDPart.forEach((row) => {
+    const months = activityMonths.get(row.Atividade) || [];
+    if (!months.length) {
+      alerts.push(alert("Atencao", "Atividade", "D x C", "Atividade preenchida na D nao encontrada na C.", { participante: row.Participante, atividade: row.Atividade }));
+    }
+    months.forEach((month) => intD.push({ ...row, Atividade_Ordenada: month.Atividade_Ordenada, ...month }));
+  });
+
+  const intF = [];
+  data.baseF.forEach((row) => {
+    inclusiveMonths(row["Mes de inicio"], row["Mes de fim"]).forEach((seq) => {
+      const cal = calendarBySeq.get(seq);
+      if (!cal) return;
+      intF.push({ Participante: row.Participante, ...cal, Marcador: 1 });
+    });
+  });
+
+  return {
+    intC,
+    intD,
+    intF,
+    calendarioAtividades: outputCalendarioAtividades(intC, data.calendario),
+    mesesTrabalhados: outputMesesTrabalhados(intD, data.calendario),
+    mesesRecebidos: outputMesesRecebidos(intF, data.calendario),
+    comparacao1: outputComparacao1(data.baseD, intD, intF),
+    comparacao2: outputComparacao2(intF, intD, data.calendario),
+  };
+}
+
+function outputCalendarioAtividades(intC, calendar) {
+  const months = orderedMonths(calendar);
+  const byActivity = new Map();
+  intC.forEach((row) => {
+    const key = row.Atividade;
+    if (!byActivity.has(key)) byActivity.set(key, { Atividades: row.Atividade, _sort: row.Atividade_Ordenada });
+    byActivity.get(key)[row.Rotulo_Mes] = 1;
+  });
+  return Array.from(byActivity.values())
+    .sort((a, b) => String(a._sort).localeCompare(String(b._sort)))
+    .map((row) => completeMonthRow(removePrivate(row), months));
+}
+
+function outputMesesTrabalhados(intD, calendar) {
+  const months = orderedMonths(calendar);
+  const byParticipant = new Map();
+  intD.forEach((row) => {
+    if (!byParticipant.has(row.Participante)) byParticipant.set(row.Participante, { Participante: row.Participante });
+    const current = byParticipant.get(row.Participante)[row.Rotulo_Mes] || [];
+    current.push(row.Atividade);
+    byParticipant.get(row.Participante)[row.Rotulo_Mes] = current;
+  });
+  return Array.from(byParticipant.values()).map((row) => {
+    const output = { Participante: row.Participante };
+    months.forEach((month) => {
+      output[month] = Array.isArray(row[month]) ? combineActivities(row[month]) : "";
+    });
+    return output;
+  });
+}
+
+function outputMesesRecebidos(intF, calendar) {
+  const months = orderedMonths(calendar);
+  const byParticipant = new Map();
+  intF.forEach((row) => {
+    if (!byParticipant.has(row.Participante)) byParticipant.set(row.Participante, { Participante: row.Participante });
+    byParticipant.get(row.Participante)[row.Rotulo_Mes] = 1;
+  });
+  return Array.from(byParticipant.values()).map((row) => completeMonthRow(row, months));
+}
+
+function outputComparacao1(baseD, intD, intF) {
+  const calculated = countDistinctMonths(intD);
+  const received = countDistinctMonths(intF);
+  return baseD.map((row) => {
+    const participant = row.Participante;
+    const informed = row["Periodo informado"];
+    const calc = calculated.get(participant) || 0;
+    const rec = received.get(participant) || 0;
+    return {
+      Participante: participant,
+      "Meses de trabalho (calculado)": calc,
+      "Meses de trabalho (informado)": informed,
+      "Calculado >= Informado?": informed !== null && calc < informed ? "Problema" : "Ok",
+      "Meses Recebidos ($)": rec,
+      "Recebido <= Informado?": informed !== null && rec > informed ? "Problema" : "Ok",
+    };
+  });
+}
+
+function outputComparacao2(intF, intD, calendar) {
+  const months = orderedMonths(calendar);
+  const planned = new Set(intD.map((row) => `${row.Participante}||${row["Mes Sequencial"]}`));
+  const byParticipant = new Map();
+  uniqueBy(intF, (row) => `${row.Participante}||${row["Mes Sequencial"]}`).forEach((row) => {
+    if (!byParticipant.has(row.Participante)) byParticipant.set(row.Participante, { Participante: row.Participante });
+    const key = `${row.Participante}||${row["Mes Sequencial"]}`;
+    byParticipant.get(row.Participante)[row.Rotulo_Mes] = planned.has(key) ? "Regular" : "Irregular";
+  });
+  return Array.from(byParticipant.values()).map((row) => completeMonthRow(row, months));
+}
+
+function addValidationAlerts(data, transformed, alerts) {
+  const planned = new Set(data.baseD.map((row) => row.Participante));
+  const paid = new Set(data.baseF.map((row) => row.Participante));
+  paid.forEach((participant) => {
+    if (!planned.has(participant)) alerts.push(alert("Erro", "Participante", "F x D", "Participante remunerado na F nao encontrado na D.", { participante: participant }));
+  });
+  planned.forEach((participant) => {
+    if (!paid.has(participant)) alerts.push(alert("Atencao", "Participante", "D x F", "Participante planejado na D nao encontrado na F.", { participante: participant }));
+  });
+
+  transformed.comparacao2.forEach((row) => {
+    const months = Object.entries(row)
+      .filter(([column, value]) => column !== "Participante" && value === "Irregular")
+      .map(([column]) => column);
+    if (months.length) {
+      alerts.push(
+        alert("Erro", "F x D", "Comparacao 2", "Participante recebeu em meses sem atividade planejada na D.", {
+          participante: row.Participante,
+          meses: months,
+        }),
+      );
+    }
+  });
+}
+
+function buildSummary(data, transformed, groupedAlerts) {
+  const errorCount = groupedAlerts.filter((item) => item.severidade === "Erro").length;
+  const warningCount = groupedAlerts.filter((item) => item.severidade === "Atencao").length;
+  return {
+    Atividades: data.baseC.length,
+    "Participantes planejados": new Set(data.baseD.map((row) => row.Participante)).size,
+    "Participantes remunerados": new Set(data.baseF.map((row) => row.Participante)).size,
+    "Registros atividade x mes": transformed.intC.length,
+    "Registros trabalho planejado x mes": transformed.intD.length,
+    "Registros remuneracao x mes": transformed.intF.length,
+    Alertas: groupedAlerts.length,
+    Erros: errorCount,
+    Atencoes: warningCount,
+  };
+}
+
+function groupAlerts(alerts) {
+  const map = new Map();
+  alerts.forEach((item) => {
+    const months = item.meses || (item.mes ? [item.mes] : []);
+    const key = [item.severidade, item.categoria, item.origem, item.participante || "", item.atividade || "", item.campo || "", item.mensagem].join("||");
+    if (!map.has(key)) {
+      map.set(key, {
+        ...item,
+        meses: [],
+        count: 0,
+      });
+    }
+    const group = map.get(key);
+    group.count += 1;
+    months.forEach((month) => {
+      if (!group.meses.includes(month)) group.meses.push(month);
+    });
+  });
+  return Array.from(map.values()).sort((a, b) => severityRank(a.severidade) - severityRank(b.severidade) || String(a.categoria).localeCompare(String(b.categoria)));
+}
+
+function renderResult(result) {
+  resultHeader.hidden = false;
+  resultTitle.textContent = result.summary.Erros ? "Processado com pontos críticos" : "Processamento concluído";
+  resultMeta.textContent = `${result.fileName} · ${formatDateTime(result.generatedAt)} · ${result.summary.Alertas} alertas agrupados`;
+  tabs.hidden = false;
+  tabs.innerHTML = VIEW_TABS.map(([id, label], index) => `<button class="tab-button${index === 0 ? " active" : ""}" type="button" data-view="${id}">${escapeHtml(label)}</button>`).join("");
+  tabs.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => selectView(button.dataset.view)));
+  state.currentView = "overview";
+  selectView("overview");
+}
+
+function selectView(viewId) {
+  state.currentView = viewId;
+  tabs.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.view === viewId));
+  viewPanel.hidden = false;
+  viewPanel.innerHTML = renderView(viewId);
+  wireViewInteractions(viewId);
+}
+
+function renderView(viewId) {
+  if (!state.result) return "";
+  if (viewId === "overview") return renderOverview();
+  if (viewId === "alerts") return renderAlertsView();
+  if (viewId === "calendar") return renderGanttView("Calendário de atividades", state.result.transformed.calendarioAtividades, "Atividades", "activity");
+  if (viewId === "worked") return renderGanttView("Meses trabalhados", state.result.transformed.mesesTrabalhados, "Participante", "worked");
+  if (viewId === "paid") return renderGanttView("Meses recebidos", state.result.transformed.mesesRecebidos, "Participante", "paid");
+  if (viewId === "comparisons") return renderComparisons();
+  if (viewId === "f-treated") return `<div class="view-content">${renderDataTable(state.result.normalized.baseF)}</div>`;
+  return "";
+}
+
+function renderOverview() {
+  const { summary, groupedAlerts } = state.result;
+  const hasErrors = summary.Erros > 0;
+  const topGroups = summarizeAlertGroups(groupedAlerts).slice(0, 5);
+  return `
+    <div class="view-content overview-layout">
+      <section class="status-block">
+        <p class="eyebrow">Status</p>
+        <h2>${hasErrors ? "Revisão necessária" : "Pronto para revisão"}</h2>
+        <div class="status-line">
+          <span class="status-dot${hasErrors ? " has-errors" : ""}"></span>
+          <span>${summary.Erros} críticos · ${summary.Atencoes} atenções · ${summary.Alertas} grupos</span>
+        </div>
+        <div class="compact-metrics">
+          ${metricRow("Atividades", summary.Atividades)}
+          ${metricRow("Participantes planejados", summary["Participantes planejados"])}
+          ${metricRow("Participantes remunerados", summary["Participantes remunerados"])}
+          ${metricRow("Trabalho x mês", summary["Registros trabalho planejado x mes"])}
+          ${metricRow("Remuneração x mês", summary["Registros remuneracao x mes"])}
+        </div>
+      </section>
+      <section class="section-block">
+        <p class="eyebrow">O que revisar primeiro</p>
+        <div class="alert-summary-list">
+          ${
+            topGroups.length
+              ? topGroups.map(renderAlertSummaryGroup).join("")
+              : '<div class="empty-state">Nenhum alerta agrupado encontrado.</div>'
+          }
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderAlertsView() {
+  return `
+    <div class="view-content">
+      <div class="filters">
+        <input id="alertSearch" class="filter-input" type="search" placeholder="Buscar participante, atividade ou mensagem" />
+        <select id="severityFilter" class="filter-select">
+          <option value="">Todas severidades</option>
+          <option value="Erro">Críticos</option>
+          <option value="Atencao">Atenções</option>
+        </select>
+        <select id="originFilter" class="filter-select">
+          <option value="">Todas origens</option>
+          ${uniqueValues(state.result.groupedAlerts.map((item) => item.origem)).map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}
+        </select>
+      </div>
+      <div id="alertList" class="alert-list">${renderAlertList(state.result.groupedAlerts)}</div>
+    </div>
+  `;
+}
+
+function renderAlertList(alerts) {
+  if (!alerts.length) return '<div class="empty-state">Nenhum alerta para os filtros atuais.</div>';
+  return alerts.map(renderAlertItem).join("");
+}
+
+function renderAlertSummaryGroup(group) {
+  return `
+    <article class="alert-group">
+      <div class="alert-group-header">
+        <div>
+          <div class="alert-title">${escapeHtml(group.categoria)}</div>
+          <div class="alert-meta">${escapeHtml(group.origem)} · ${group.total} ocorrência(s)</div>
+        </div>
+        <span class="badge ${group.errors ? "error" : "warning"}">${group.errors} críticos · ${group.warnings} atenções</span>
+      </div>
+    </article>
+  `;
+}
+
+function renderAlertItem(item) {
+  const badgeClass = item.severidade === "Erro" ? "error" : "warning";
+  const context = [item.participante, item.atividade, item.campo].filter(Boolean).join(" · ");
+  const months = item.meses?.length ? `<div class="badge-row">${item.meses.map((month) => `<span class="badge">${escapeHtml(month)}</span>`).join("")}</div>` : "";
+  return `
+    <article class="alert-item" data-search="${escapeHtml(normalizeText([item.severidade, item.categoria, item.origem, item.participante, item.atividade, item.campo, item.mensagem, (item.meses || []).join(" ")].join(" ")))}" data-severity="${escapeHtml(item.severidade)}" data-origin="${escapeHtml(item.origem)}">
+      <div class="alert-item-header">
+        <div>
+          <div class="alert-title">${escapeHtml(item.mensagem)}</div>
+          <div class="alert-meta">${escapeHtml(item.categoria)} · ${escapeHtml(item.origem)}${context ? ` · ${escapeHtml(context)}` : ""}</div>
+        </div>
+        <span class="badge ${badgeClass}">${escapeHtml(item.severidade)}${item.count > 1 ? ` · ${item.count}` : ""}</span>
+      </div>
+      ${months}
+    </article>
+  `;
+}
+
+function renderGanttView(title, rows, labelKey, type) {
+  const months = monthColumns(rows);
+  if (!rows.length || !months.length) {
+    return `<div class="view-content"><h2>${escapeHtml(title)}</h2><div class="empty-state">Sem dados para exibir.</div></div>`;
+  }
+  return `
+    <div class="view-content">
+      <p class="eyebrow">Visualização mensal</p>
+      <h2>${escapeHtml(title)}</h2>
+      <div class="gantt-shell">
+        <table class="gantt">
+          <thead>
+            <tr>
+              <th class="label-col">${escapeHtml(labelKey)}</th>
+              ${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}</th>`).join("")}
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((row) => renderGanttRow(row, months, labelKey, type)).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderGanttRow(row, months, labelKey, type) {
+  return `
+    <tr>
+      <td class="label-col">${escapeHtml(row[labelKey] || "")}</td>
+      ${months.map((month) => renderGanttCell(row, month, type)).join("")}
+    </tr>
+  `;
+}
+
+function renderGanttCell(row, month, type) {
+  const value = row[month];
+  if (isBlank(value)) return '<td class="month-cell"></td>';
+  const title = `${row.Atividades || row.Participante || ""} · ${month}${type === "worked" ? ` · atividades ${value}` : ""}`;
+  if (type === "worked") return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark worked">${escapeHtml(value)}</span></td>`;
+  if (type === "paid") return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark paid"></span></td>`;
+  return `<td class="month-cell" title="${escapeHtml(title)}"><span class="mark activity"></span></td>`;
+}
+
+function renderComparisons() {
+  return `
+    <div class="view-content">
+      <section class="section-block">
+        <p class="eyebrow">Resumo por participante</p>
+        ${renderDataTable(state.result.transformed.comparacao1)}
+      </section>
+      <section class="section-block" style="margin-top: 16px;">
+        <p class="eyebrow">Regularidade mês a mês</p>
+        ${renderComparison2Gantt(state.result.transformed.comparacao2)}
+      </section>
+    </div>
+  `;
+}
+
+function renderComparison2Gantt(rows) {
+  const months = monthColumns(rows);
+  if (!rows.length || !months.length) return '<div class="empty-state">Sem dados para exibir.</div>';
+  return `
+    <div class="gantt-shell">
+      <table class="gantt">
+        <thead>
+          <tr><th class="label-col">Participante</th>${months.map((month) => `<th>${escapeHtml(shortMonthHeader(month))}</th>`).join("")}</tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (row) => `<tr><td class="label-col">${escapeHtml(row.Participante || "")}</td>${months
+                .map((month) => {
+                  const value = row[month];
+                  return isBlank(value) ? '<td class="month-cell"></td>' : `<td class="month-cell"><span class="status-cell ${escapeHtml(value)}">${escapeHtml(value)}</span></td>`;
+                })
+                .join("")}</tr>`,
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderDataTable(rows) {
+  if (!rows.length) return '<div class="empty-state">Sem dados para exibir.</div>';
+  const columns = Object.keys(rows[0]);
+  const body = rows
+    .slice(0, 300)
+    .map((row) => `<tr class="${escapeHtml(row.Severidade || "")}">${columns.map((column) => `<td>${formatDisplay(row[column])}</td>`).join("")}</tr>`)
+    .join("");
+  return `<div class="table-shell"><table class="data-table"><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function wireViewInteractions(viewId) {
+  if (viewId !== "alerts") return;
+  const search = document.querySelector("#alertSearch");
+  const severity = document.querySelector("#severityFilter");
+  const origin = document.querySelector("#originFilter");
+  [search, severity, origin].forEach((control) => control.addEventListener("input", applyAlertFilters));
+}
+
+function applyAlertFilters() {
+  const term = normalizeText(document.querySelector("#alertSearch").value);
+  const severity = document.querySelector("#severityFilter").value;
+  const origin = document.querySelector("#originFilter").value;
+  const filtered = state.result.groupedAlerts.filter((item) => {
+    const searchable = normalizeText([item.severidade, item.categoria, item.origem, item.participante, item.atividade, item.campo, item.mensagem, (item.meses || []).join(" ")].join(" "));
+    return (!term || searchable.includes(term)) && (!severity || item.severidade === severity) && (!origin || item.origem === origin);
+  });
+  document.querySelector("#alertList").innerHTML = renderAlertList(filtered);
+}
+
+function downloadProcessedWorkbook() {
+  if (!state.result) return;
+  const workbook = XLSX.utils.book_new();
+  Object.entries(state.result.exportOutputs).forEach(([name, rows]) => {
+    const worksheet = styledSheet(rows.map(serializeRow), name);
+    XLSX.utils.book_append_sheet(workbook, worksheet, safeSheetName(name));
+  });
+  XLSX.writeFile(workbook, `controle_hh_processado_${timestamp()}.xlsx`);
+}
+
+function styledSheet(rows, sheetName) {
+  const worksheet = XLSX.utils.json_to_sheet(rows.length ? rows : [{}], { cellDates: true });
+  const range = worksheet["!ref"] ? XLSX.utils.decode_range(worksheet["!ref"]) : null;
+  if (!range) return worksheet;
+  worksheet["!autofilter"] = { ref: worksheet["!ref"] };
+  worksheet["!freeze"] = { xSplit: 0, ySplit: 1 };
+  worksheet["!cols"] = columnWidths(rows, range);
+
+  for (let row = range.s.r; row <= range.e.r; row += 1) {
+    for (let col = range.s.c; col <= range.e.c; col += 1) {
+      const address = XLSX.utils.encode_cell({ r: row, c: col });
+      if (!worksheet[address]) continue;
+      const header = row === 0;
+      worksheet[address].s = cellStyle(worksheet[address].v, header, sheetName, col);
+    }
+  }
+  return worksheet;
+}
+
+function cellStyle(value, header, sheetName, col) {
+  const border = {
+    top: { style: "thin", color: { rgb: "D9E1EA" } },
+    bottom: { style: "thin", color: { rgb: "D9E1EA" } },
+    left: { style: "thin", color: { rgb: "D9E1EA" } },
+    right: { style: "thin", color: { rgb: "D9E1EA" } },
+  };
+  if (header) {
+    return {
+      font: { bold: true, color: { rgb: "FFFFFF" } },
+      fill: { fgColor: { rgb: "1F5F99" } },
+      alignment: { horizontal: "center", vertical: "center", wrapText: true },
+      border,
+    };
+  }
+  const style = { alignment: { vertical: "top", wrapText: true }, border };
+  if (value === "Erro" || value === "Problema" || value === "Irregular") style.fill = { fgColor: { rgb: "FDE8E4" } };
+  if (value === "Atencao") style.fill = { fgColor: { rgb: "FFF2CC" } };
+  if (value === "Ok" || value === "Regular") style.fill = { fgColor: { rgb: "DFF4EA" } };
+  if (isMonthSheet(sheetName) && col > 0 && !isBlank(value)) style.fill = { fgColor: { rgb: sheetName.includes("Recebidos") ? "DFF4EA" : "DCEBFF" } };
+  return style;
+}
+
+function columnWidths(rows, range) {
+  const widths = [];
+  for (let col = range.s.c; col <= range.e.c; col += 1) {
+    let max = 10;
+    rows.slice(0, 300).forEach((row) => {
+      const value = Object.values(row)[col];
+      max = Math.max(max, Math.min(36, String(value ?? "").length + 2));
+    });
+    widths.push({ wch: max });
+  }
+  return widths;
+}
+
+function findSheet(workbook, aliases) {
+  const byName = new Map(workbook.SheetNames.map((name) => [normalizeText(name), workbook.Sheets[name]]));
+  for (const alias of aliases) {
+    const sheet = byName.get(normalizeText(alias));
+    if (sheet) return sheet;
+  }
+  return null;
+}
+
+function sheetRows(sheet) {
+  return XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw: true });
+}
+
+function findHeaderRow(rows, tokens, maxRows) {
+  const wanted = tokens.map(normalizeText);
+  for (let i = 0; i < Math.min(rows.length, maxRows); i += 1) {
+    const text = normalizeText(rows[i].join(" "));
+    if (wanted.every((token) => text.includes(token))) return i;
+  }
+  return -1;
+}
+
+function alert(severidade, categoria, origem, mensagem, extra = {}) {
+  return { severidade, categoria, origem, mensagem, ...extra };
+}
+
+function alertGroupRecord(item) {
+  return {
+    Severidade: item.severidade,
+    Categoria: item.categoria,
+    Origem: item.origem,
+    Participante: item.participante || "",
+    Atividade: item.atividade || "",
+    Meses: item.meses?.join(", ") || "",
+    Campo: item.campo || "",
+    Ocorrencias: item.count || 1,
+    Mensagem: item.mensagem,
+  };
+}
+
+function objectToRows(object) {
+  return Object.entries(object).map(([Indicador, Valor]) => ({ Indicador, Valor }));
+}
+
+function summarizeAlertGroups(alerts) {
+  const map = new Map();
+  alerts.forEach((item) => {
+    const key = `${item.categoria}||${item.origem}`;
+    if (!map.has(key)) map.set(key, { categoria: item.categoria, origem: item.origem, errors: 0, warnings: 0, total: 0 });
+    const group = map.get(key);
+    group.total += 1;
+    if (item.severidade === "Erro") group.errors += 1;
+    else group.warnings += 1;
+  });
+  return Array.from(map.values()).sort((a, b) => b.errors - a.errors || b.total - a.total);
+}
+
+function metricRow(label, value) {
+  return `<div class="metric-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
+}
+
+function monthColumns(rows) {
+  if (!rows.length) return [];
+  return Object.keys(rows[0]).filter((key) => /^\d{2} - /.test(key));
+}
+
+function shortMonthHeader(label) {
+  return label.replace(/^\d{2} - /, "");
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
+}
+
+function severityRank(value) {
+  return value === "Erro" ? 0 : value === "Atencao" ? 1 : 2;
+}
+
+function normalizeText(value) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isBlank(value) {
+  return value === null || value === undefined || String(value).trim() === "";
+}
+
+function clean(value) {
+  return String(value ?? "").trim();
+}
+
+function firstNonBlank(values) {
+  return values.find((value) => !isBlank(value)) ?? "";
+}
+
+function toNumber(value) {
+  if (isBlank(value)) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  let text = String(value).replace("R$", "").replace("%", "").trim();
+  if (text.includes(",") && text.includes(".")) text = text.replace(/\./g, "").replace(",", ".");
+  else text = text.replace(",", ".");
+  const number = Number(text);
+  return Number.isFinite(number) ? number : null;
+}
+
+function toInt(value) {
+  const number = toNumber(value);
+  return number === null ? null : Math.trunc(number);
+}
+
+function toDate(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return dateOnly(value);
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (!parsed) return null;
+    return new Date(parsed.y, parsed.m - 1, parsed.d);
+  }
+  if (isBlank(value)) return null;
+  const text = String(value).trim();
+  const br = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (br) return new Date(Number(br[3]), Number(br[2]) - 1, Number(br[1]));
+  const iso = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+  const fallback = new Date(text);
+  return Number.isNaN(fallback.getTime()) ? null : dateOnly(fallback);
+}
+
+function dateOnly(value) {
+  return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+}
+
+function dateFromYearMonth(yearValue, monthValue) {
+  const year = toInt(yearValue);
+  const month = monthNumber(monthValue);
+  if (!year || !month) return null;
+  return new Date(year, month - 1, 1);
+}
+
+function monthNumber(value) {
+  const number = toInt(value);
+  if (number && number >= 1 && number <= 12) return number;
+  const key = normalizeText(value);
+  const index = MONTHS.findIndex(([full, short]) => normalizeText(full) === key || normalizeText(short) === key);
+  return index >= 0 ? index + 1 : null;
+}
+
+function monthStart(value) {
+  return new Date(value.getFullYear(), value.getMonth(), 1);
+}
+
+function addMonths(value, count) {
+  return new Date(value.getFullYear(), value.getMonth() + count, 1);
+}
+
+function monthIndex(projectStart, value) {
+  const start = monthStart(projectStart);
+  const current = monthStart(value);
+  return (current.getFullYear() - start.getFullYear()) * 12 + current.getMonth() - start.getMonth();
+}
+
+function monthYearLabel(value) {
+  return `${MONTHS[value.getMonth()][1]}/${String(value.getFullYear()).slice(-2)}`;
+}
+
+function inclusiveMonths(start, end) {
+  if (start === null || start === undefined || end === null || end === undefined || end < start) return [];
+  return Array.from({ length: end - start + 1 }, (_, index) => start + index);
+}
+
+function activitySortName(value) {
+  const match = clean(value).match(/(\d+)/);
+  return match ? `ATIV. ${String(Number(match[1])).padStart(2, "0")}` : clean(value);
+}
+
+function activityShort(value) {
+  const match = clean(value).match(/(\d+)/);
+  return match ? String(Number(match[1])) : clean(value);
+}
+
+function combineActivities(values) {
+  const numbers = values.map(activityShort).map(Number).filter(Number.isFinite);
+  return [...new Set(numbers)].sort((a, b) => a - b).join(", ");
+}
+
+function safeDiv(left, right) {
+  return left === null || right === null || right === 0 ? null : left / right;
+}
+
+function orderedMonths(calendar) {
+  return [...calendar].sort((a, b) => a["Mes Sequencial"] - b["Mes Sequencial"]).map((row) => row.Rotulo_Mes);
+}
+
+function completeMonthRow(row, months) {
+  const output = { ...row };
+  months.forEach((month) => {
+    if (!(month in output)) output[month] = "";
+  });
+  return output;
+}
+
+function countDistinctMonths(rows) {
+  const map = new Map();
+  rows.forEach((row) => {
+    if (!map.has(row.Participante)) map.set(row.Participante, new Set());
+    map.get(row.Participante).add(row["Mes Sequencial"]);
+  });
+  return new Map(Array.from(map.entries()).map(([key, value]) => [key, value.size]));
+}
+
+function groupBy(rows, key) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const value = row[key];
+    if (!map.has(value)) map.set(value, []);
+    map.get(value).push(row);
+  });
+  return map;
+}
+
+function uniqueBy(rows, keyFn) {
+  const seen = new Set();
+  return rows.filter((row) => {
+    const key = keyFn(row);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function removePrivate(row) {
+  return Object.fromEntries(Object.entries(row).filter(([key]) => !key.startsWith("_")));
+}
+
+function minDate(values) {
+  return values.reduce((min, value) => (value < min ? value : min), values[0]);
+}
+
+function maxDate(values) {
+  return values.reduce((max, value) => (value > max ? value : max), values[0]);
+}
+
+function looksLikeActivity(value) {
+  const text = normalizeText(value);
+  return text.startsWith("ativ.") || text.startsWith("ativ ");
+}
+
+function serializeRow(row) {
+  return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value instanceof Date ? value : value ?? ""]));
+}
+
+function safeSheetName(name) {
+  return name.replace(/[\[\]:*?/\\]/g, "_").slice(0, 31);
+}
+
+function isMonthSheet(name) {
+  return ["Calendario atividades", "Meses Trabalhados", "Meses Recebidos ($)"].includes(name);
+}
+
+function timestamp() {
+  const now = new Date();
+  return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatDateTime(value) {
+  return value.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+}
+
+function formatDisplay(value) {
+  if (value instanceof Date) return escapeHtml(value.toLocaleDateString("pt-BR"));
+  return escapeHtml(value ?? "");
+}
+
+function clearResults() {
+  resultHeader.hidden = true;
+  tabs.hidden = true;
+  viewPanel.hidden = true;
+}
+
+function setStatus(message, isError = false) {
+  statusText.textContent = message;
+  statusText.style.color = isError ? "var(--red)" : "var(--muted)";
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
