@@ -34,7 +34,7 @@ const ALERT_EXPLAINS = {
   "F x D": "Recebe sem trabalhar: participante remunerado sem atividades previstas.",
   "D x F": "Planejado sem receber: participante presente apenas na aba D, sem remuneração na F.",
   "Comparacao 2": "Recebeu em meses sem atividade planejada na D.",
-  "Horas/mes": "Carga mensal acima de 170h.",
+  "Horas/mes": "Carga mensal acima de 176h.",
   "HH": "Valor-hora (HH) acima de R$ 250.",
   "Encargos 80": "Encargos acima de 80% da remuneração.",
   "Encargos 100": "Encargos acima de 100% da remuneração.",
@@ -578,8 +578,8 @@ function addPayrollAlerts(baseF, alerts) {
     const hoursPerMonth = toNumber(row["Horas trabalhadas/mes"]);
     const hh = toNumber(row.HH);
     const charges = toNumber(row["% de encargos"]);
-    if (hoursPerMonth > 170) {
-      alerts.push(alert("Atencao", "Carga horária", "Horas/mes", "Carga mensal acima de 170h.", { participante: who, explainKey: "Horas/mes" }));
+    if (hoursPerMonth > 176) {
+      alerts.push(alert("Atencao", "Carga horária", "Horas/mes", "Carga mensal acima de 176h.", { participante: who, explainKey: "Horas/mes" }));
     }
     if (hh > 250) {
       alerts.push(alert("Atencao", "Valor-hora", "HH", "Valor-hora (HH) acima de R$ 250.", { participante: who, explainKey: "HH" }));
