@@ -652,6 +652,10 @@ button:disabled {
   margin-bottom: var(--s4);
 }
 
+.filters.f-filters {
+  grid-template-columns: minmax(240px, 420px);
+}
+
 /* ---------- Gantt ---------- */
 .gantt-toolbar {
   display: flex;
@@ -894,12 +898,13 @@ table.data-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  min-width: max-content;
 }
 
 .data-table th,
 .data-table td {
   border-bottom: 1px solid var(--line-soft);
-  padding: 8px 10px;
+  padding: 9px 12px;
   text-align: left;
   vertical-align: top;
 }
@@ -920,6 +925,18 @@ table.data-table {
   text-align: right;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.data-table td.cell-warning {
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-weight: 700;
+}
+
+.data-table td.cell-error {
+  background: var(--red-soft);
+  color: var(--red-2);
+  font-weight: 700;
 }
 
 .Erro td { background: var(--red-soft); }
